@@ -188,6 +188,19 @@ async function postFeedback(form, productId = "") {
   else await refreshFeedback();
 }
 
+async function submitInquiry(form) {
+  const payload = Object.fromEntries(new FormData(form));
+  const result = await fetchJson("/api/inquiries", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+  const note = qs(".contact-note", form);
+  if (note) {
+    note.textContent = `Enquiry saved for ${result.inquiry.name}. Check Admin > Inquiries or MySQL Workbench.`;
+  }
+  form.reset();
+}
+
 function productPanelHtml(product, reviews) {
   const images = product.images?.length ? product.images : ["/images/product.svg"];
   return `
@@ -443,6 +456,10 @@ document.addEventListener("submit", async (event) => {
     if (form.matches(".review-form")) {
       event.preventDefault();
       await postFeedback(form, form.dataset.productId);
+    }
+    if (form.matches(".contact-form")) {
+      event.preventDefault();
+      await submitInquiry(form);
     }
     if (form.matches("#productForm")) {
       event.preventDefault();

@@ -60,9 +60,10 @@ function mysqlBool(value) {
 function mysqlRun(sql) {
   const wrapped = `USE \`${MYSQL_DATABASE}\`;\nSET FOREIGN_KEY_CHECKS = 1;\n${sql}\n`;
   fs.writeFileSync(MYSQL_SYNC_PATH, wrapped, "utf8");
-  const result = spawnSync("mysql", ["-h", MYSQL_HOST, "-u", MYSQL_USER, `--database=${MYSQL_DATABASE}`, `--execute=source ${MYSQL_SYNC_PATH.replace(/\\/g, "/")}`], {
+  const result = spawnSync("mysql", ["-h", MYSQL_HOST, "-u", MYSQL_USER, `--database=${MYSQL_DATABASE}`], {
     cwd: ROOT,
     env: { ...process.env, MYSQL_PWD: MYSQL_PASSWORD },
+    input: wrapped,
     encoding: "utf8"
   });
   if (result.status !== 0) {
@@ -116,6 +117,19 @@ function mysqlSyncInquiry(row) {
     VALUES (${row.id}, ${mysqlEscape(row.name)}, ${mysqlEscape(row.email)}, ${mysqlEscape(row.phone)}, ${mysqlEscape(row.message)}, 'new', ${mysqlEscape(mysqlDate(row.created_at))})
     ON DUPLICATE KEY UPDATE name = VALUES(name), email = VALUES(email), phone = VALUES(phone), message = VALUES(message), created_at = VALUES(created_at);
   `);
+}
+
+function saveInquiry(data) {
+  const name = String(data.name || "").trim();
+  const email = String(data.email || "").trim();
+  const phone = String(data.phone || "").trim();
+  const message = String(data.message || "").trim();
+  if (!name || !email || !phone || !message) return { error: "All inquiry fields are required" };
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return { error: "Valid email is required" };
+  const result = db.prepare("INSERT INTO inquiries (name, email, phone, message, created_at) VALUES (?, ?, ?, ?, ?)").run(name, email, phone, message, nowSql());
+  const inquiry = db.prepare("SELECT * FROM inquiries WHERE id = ?").get(result.lastInsertRowid);
+  mysqlSyncInquiry(inquiry);
+  return { inquiry };
 }
 
 function mysqlSyncOtp(row) {
@@ -694,6 +708,7 @@ function FeedbackPage(req, visitor) {
 }
 
 function ContactPage(req) {
+  const sent = new URL(req.url, `http://${req.headers.host || "localhost"}`).searchParams.get("sent") === "1";
   return layout("Contact", `
     <section class="page-title compact"><p class="eyebrow">Contact</p><h1>Send an enquiry for pricing, stock, or bulk supply.</h1></section>
     <section class="contact-layout">
@@ -703,6 +718,7 @@ function ContactPage(req) {
         <label>Phone<input name="phone" required /></label>
         <label>Message<textarea name="message" rows="5" required></textarea></label>
         <button class="button primary" type="submit">Send Enquiry</button>
+        <p class="form-note contact-note">${sent ? "Enquiry saved. We will contact you shortly." : ""}</p>
       </form>
       <aside class="contact-card">
         <h2>Business details</h2>
@@ -850,8 +866,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/wholesale") return send(res, 302, "", { Location: "/products" });
     if (req.method === "POST" && url.pathname === "/contact") {
       const data = await readBody(req);
-      const result = db.prepare("INSERT INTO inquiries (name, email, phone, message, created_at) VALUES (?, ?, ?, ?, ?)").run(data.name || "", data.email || "", data.phone || "", data.message || "", nowSql());
-      mysqlSyncInquiry(db.prepare("SELECT * FROM inquiries WHERE id = ?").get(result.lastInsertRowid));
+      const result = saveInquiry(data);
+      if (result.error) return send(res, 400, ContactPage(req), { "Content-Type": "text/html; charset=utf-8" });
       return send(res, 302, "", { Location: "/contact?sent=1" });
     }
 
@@ -877,6 +893,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/api/products") return json(res, 200, { products: getProducts() });
+    if (req.method === "POST" && url.pathname === "/api/inquiries") {
+      const result = saveInquiry(await readBody(req));
+      if (result.error) return json(res, 400, { error: result.error });
+      return json(res, 201, { inquiry: result.inquiry, message: "Enquiry saved" });
+    }
     const productMatch = url.pathname.match(/^\/api\/products\/(\d+)$/);
     if (req.method === "GET" && productMatch) {
       const product = getProduct(Number(productMatch[1]));

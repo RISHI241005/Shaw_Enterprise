@@ -4,8 +4,8 @@
   "description": "Professional full-stack website for Shaw Enterprise.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "node --experimental-sqlite server.js",
+    "dev": "node --experimental-sqlite server.js"
   },
   "keywords": [
     "shaw-enterprise",
