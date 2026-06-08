@@ -9,6 +9,7 @@ const state = {
   productPanelProduct: null,
   productPanelReviews: [],
   adminProducts: [],
+  adminInquiries: [],
   productFormImages: []
 };
 
@@ -23,8 +24,9 @@ function escapeHtml(value = "") {
 }
 
 function fetchJson(url, options = {}) {
+  const csrfToken = qs("meta[name='csrf-token']")?.content || "";
   return fetch(url, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    headers: { "Content-Type": "application/json", ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}), ...(options.headers || {}) },
     ...options
   }).then(async (response) => {
     const data = await response.json().catch(() => ({}));
@@ -340,6 +342,23 @@ function renderAdminFeedback(items) {
     </article>`).join("") || "<p>No feedback yet.</p>";
 }
 
+function renderAdminInquiries(items) {
+  const root = qs("#adminInquiries");
+  if (!root) return;
+  state.adminInquiries = items || [];
+  root.innerHTML = state.adminInquiries.map((item) => `
+    <article class="admin-row inquiry-row status-${escapeHtml(item.status || "new")}">
+      <div>
+        <strong>${escapeHtml(item.name)}</strong>
+        <p>${escapeHtml(item.message)}</p>
+        <small>${escapeHtml(item.email)} | ${escapeHtml(item.phone)} | ${escapeHtml(item.status || "new")} | ${relativeTime(item.created_at)}</small>
+      </div>
+      <select class="inquiry-status" data-inquiry-id="${item.id}">
+        ${["new", "contacted", "closed"].map((status) => `<option value="${status}" ${status === (item.status || "new") ? "selected" : ""}>${status}</option>`).join("")}
+      </select>
+    </article>`).join("") || "<p>No inquiries yet.</p>";
+}
+
 function renderAuditLog(items) {
   const root = qs("#auditLog");
   if (!root) return;
@@ -360,6 +379,11 @@ async function refreshAdmin() {
     const feedback = await fetchJson("/api/admin/feedback");
     renderAdminFeedback(feedback.feedback);
     renderAuditLog(feedback.auditLogs);
+  }
+  if (qs("#adminInquiries")) {
+    const inquiries = await fetchJson("/api/admin/inquiries");
+    renderAdminInquiries(inquiries.inquiries);
+    renderAuditLog(inquiries.auditLogs);
   }
 }
 
@@ -480,6 +504,20 @@ document.addEventListener("submit", async (event) => {
 
 document.addEventListener("change", async (event) => {
   const input = event.target;
+  if (input.matches(".inquiry-status")) {
+    try {
+      const result = await fetchJson(`/api/admin/inquiries/${input.dataset.inquiryId}/status`, {
+        method: "POST",
+        body: JSON.stringify({ status: input.value })
+      });
+      renderAdminInquiries(result.inquiries);
+      renderAuditLog(result.auditLogs);
+    } catch (error) {
+      alert(error.message);
+      await refreshAdmin();
+    }
+    return;
+  }
   if (!input.matches("input[name='imageFiles']")) return;
   try {
     const selected = await Promise.all(Array.from(input.files || []).map(readImageFile));

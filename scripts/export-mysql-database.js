@@ -209,7 +209,7 @@ FROM product_categories WHERE LOWER(name) = LOWER(${esc(product.category)});`);
 }
 
 for (const inquiry of inquiries) {
-  lines.push(`INSERT INTO inquiries (id, name, email, phone, message, created_at) VALUES (${inquiry.id}, ${esc(inquiry.name)}, ${esc(inquiry.email)}, ${esc(inquiry.phone)}, ${esc(inquiry.message)}, ${esc(mysqlDate(inquiry.created_at))});`);
+  lines.push(`INSERT INTO inquiries (id, name, email, phone, message, status, created_at) VALUES (${inquiry.id}, ${esc(inquiry.name)}, ${esc(inquiry.email)}, ${esc(inquiry.phone)}, ${esc(inquiry.message)}, ${esc(inquiry.status || "new")}, ${esc(mysqlDate(inquiry.created_at))});`);
 }
 
 for (const identity of identities) {

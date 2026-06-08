@@ -452,6 +452,21 @@ textarea { resize: vertical; }
   }
 }
 
+.inquiry-row {
+  border-left: 4px solid var(--line);
+}
+.inquiry-row.status-new { border-left-color: #d9a520; }
+.inquiry-row.status-contacted { border-left-color: #2f7f66; }
+.inquiry-row.status-closed { border-left-color: #7d8790; opacity: .78; }
+.inquiry-status {
+  min-width: 132px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: white;
+  font: inherit;
+}
+
 .site-footer {
   display: flex;
   justify-content: space-between;

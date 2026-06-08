@@ -6,9 +6,11 @@ const { spawnSync } = require("node:child_process");
 const { DatabaseSync } = require("node:sqlite");
 
 const PORT = Number(process.env.PORT || 3000);
+const NODE_ENV = process.env.NODE_ENV || "development";
+const IS_PRODUCTION = NODE_ENV === "production";
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, "public");
-const DATA_DIR = path.join(ROOT, "data");
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(ROOT, "data");
 const DB_PATH = path.join(DATA_DIR, "shaw-enterprise.db");
 const MYSQL_SYNC_PATH = path.join(DATA_DIR, "mysql-live-sync.sql");
 
@@ -17,8 +19,12 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "change-me-now";
 const SESSION_SECRET = process.env.SESSION_SECRET || "local-dev-secret-change-before-production";
 const MYSQL_HOST = process.env.MYSQL_HOST || "localhost";
 const MYSQL_USER = process.env.MYSQL_USER || "root";
-const MYSQL_PASSWORD = process.env.MYSQL_PASSWORD || "Rishi@042405";
+const MYSQL_PASSWORD = process.env.MYSQL_PASSWORD || "";
 const MYSQL_DATABASE = process.env.MYSQL_DATABASE || "shaw_enterprise";
+const MYSQL_SYNC_ENABLED = process.env.MYSQL_SYNC_ENABLED === "true";
+const EMAIL_PROVIDER = process.env.EMAIL_PROVIDER || "dev";
+const CSRF_TOKEN_TTL_MS = 60 * 60 * 1000;
+const rateLimits = new Map();
 
 const settings = {
   phone: process.env.BUSINESS_PHONE || "+91 00000 00000",
@@ -26,7 +32,26 @@ const settings = {
   address: process.env.BUSINESS_ADDRESS || "Your shop address, city, state",
   whatsapp: process.env.WHATSAPP_NUMBER || "910000000000"
 };
+const EMAIL_FROM = process.env.EMAIL_FROM || settings.email;
 
+function validateStartupConfig() {
+  const errors = [];
+  if (!Number.isInteger(PORT) || PORT <= 0) errors.push("PORT must be a positive integer");
+  if (IS_PRODUCTION) {
+    if (!process.env.ADMIN_USER || !process.env.ADMIN_PASSWORD) errors.push("ADMIN_USER and ADMIN_PASSWORD are required in production");
+    if (ADMIN_PASSWORD === "change-me-now" || ADMIN_PASSWORD.length < 12) errors.push("ADMIN_PASSWORD must be changed and at least 12 characters in production");
+    if (!process.env.SESSION_SECRET || SESSION_SECRET.length < 32 || SESSION_SECRET === "local-dev-secret-change-before-production") errors.push("SESSION_SECRET must be set to a strong 32+ character value in production");
+    if (EMAIL_PROVIDER === "dev") errors.push("EMAIL_PROVIDER must be configured in production");
+  }
+  if (MYSQL_SYNC_ENABLED && !MYSQL_PASSWORD) {
+    console.warn("MySQL live sync disabled until MYSQL_PASSWORD is provided.");
+  }
+  if (errors.length) {
+    throw new Error(`Startup configuration invalid:\n- ${errors.join("\n- ")}`);
+  }
+}
+
+validateStartupConfig();
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const db = new DatabaseSync(DB_PATH);
 db.exec("PRAGMA foreign_keys = ON");
@@ -58,6 +83,7 @@ function mysqlBool(value) {
 }
 
 function mysqlRun(sql) {
+  if (!MYSQL_SYNC_ENABLED || !MYSQL_PASSWORD) return false;
   const wrapped = `USE \`${MYSQL_DATABASE}\`;\nSET FOREIGN_KEY_CHECKS = 1;\n${sql}\n`;
   fs.writeFileSync(MYSQL_SYNC_PATH, wrapped, "utf8");
   const result = spawnSync("mysql", ["-h", MYSQL_HOST, "-u", MYSQL_USER, `--database=${MYSQL_DATABASE}`], {
@@ -114,8 +140,8 @@ function mysqlDeleteProduct(id) {
 function mysqlSyncInquiry(row) {
   mysqlRun(`
     INSERT INTO inquiries (id, name, email, phone, message, status, created_at)
-    VALUES (${row.id}, ${mysqlEscape(row.name)}, ${mysqlEscape(row.email)}, ${mysqlEscape(row.phone)}, ${mysqlEscape(row.message)}, 'new', ${mysqlEscape(mysqlDate(row.created_at))})
-    ON DUPLICATE KEY UPDATE name = VALUES(name), email = VALUES(email), phone = VALUES(phone), message = VALUES(message), created_at = VALUES(created_at);
+    VALUES (${row.id}, ${mysqlEscape(row.name)}, ${mysqlEscape(row.email)}, ${mysqlEscape(row.phone)}, ${mysqlEscape(row.message)}, ${mysqlEscape(row.status || "new")}, ${mysqlEscape(mysqlDate(row.created_at))})
+    ON DUPLICATE KEY UPDATE name = VALUES(name), email = VALUES(email), phone = VALUES(phone), message = VALUES(message), status = VALUES(status), created_at = VALUES(created_at);
   `);
 }
 
@@ -129,6 +155,17 @@ function saveInquiry(data) {
   const result = db.prepare("INSERT INTO inquiries (name, email, phone, message, created_at) VALUES (?, ?, ?, ?, ?)").run(name, email, phone, message, nowSql());
   const inquiry = db.prepare("SELECT * FROM inquiries WHERE id = ?").get(result.lastInsertRowid);
   mysqlSyncInquiry(inquiry);
+  return { inquiry };
+}
+
+function updateInquiryStatus(req, id, status) {
+  if (!["new", "contacted", "closed"].includes(status)) return { error: "Invalid inquiry status" };
+  const existing = db.prepare("SELECT * FROM inquiries WHERE id = ?").get(id);
+  if (!existing) return { error: "Inquiry not found", statusCode: 404 };
+  db.prepare("UPDATE inquiries SET status = ? WHERE id = ?").run(status, id);
+  const inquiry = db.prepare("SELECT * FROM inquiries WHERE id = ?").get(id);
+  mysqlSyncInquiry(inquiry);
+  logAudit(req, "update_status", "inquiry", id, `Inquiry marked ${status}`);
   return { inquiry };
 }
 
@@ -314,6 +351,7 @@ function initDb() {
       email TEXT NOT NULL,
       phone TEXT NOT NULL,
       message TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'new',
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -368,6 +406,11 @@ function initDb() {
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
   `);
+
+  const inquiryColumns = db.prepare("PRAGMA table_info(inquiries)").all().map((column) => column.name);
+  if (!inquiryColumns.includes("status")) {
+    db.exec("ALTER TABLE inquiries ADD COLUMN status TEXT NOT NULL DEFAULT 'new'");
+  }
 
   const productCount = db.prepare("SELECT COUNT(*) AS count FROM products").get().count;
   const seed = db.prepare(`
@@ -441,6 +484,44 @@ function getVisitor(req, res) {
     setCookie(res, "visitor_id", id, { maxAge: 60 * 60 * 24 * 365, httpOnly: true, sameSite: "Lax" });
   }
   return { id };
+}
+
+function getCsrfToken(req, res) {
+  const cookies = parseCookies(req);
+  let token = cookies.csrf_token;
+  if (!token || !/^[a-f0-9]{48}$/.test(token)) {
+    token = crypto.randomBytes(24).toString("hex");
+    setCookie(res, "csrf_token", token, { maxAge: Math.floor(CSRF_TOKEN_TTL_MS / 1000), sameSite: "Strict" });
+  }
+  return token;
+}
+
+function requestCsrfToken(req) {
+  const token = req.headers["x-csrf-token"];
+  if (typeof token === "string") return token;
+  return "";
+}
+
+function validateCsrf(req, token, body = null) {
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return true;
+  const cookies = parseCookies(req);
+  const submitted = requestCsrfToken(req) || String(body?._csrf || "");
+  return Boolean(cookies.csrf_token && submitted && cookies.csrf_token === submitted && cookies.csrf_token === token);
+}
+
+function rateLimit(req, bucket, options = {}) {
+  const limit = options.limit || 30;
+  const windowMs = options.windowMs || 60 * 1000;
+  const key = `${bucket}:${req.socket.remoteAddress || "unknown"}`;
+  const now = Date.now();
+  const entry = rateLimits.get(key) || { count: 0, resetAt: now + windowMs };
+  if (now > entry.resetAt) {
+    entry.count = 0;
+    entry.resetAt = now + windowMs;
+  }
+  entry.count += 1;
+  rateLimits.set(key, entry);
+  return entry.count <= limit;
 }
 
 function reactionCounts(id) {
@@ -518,6 +599,10 @@ function getAuditLogs() {
   return db.prepare("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80").all();
 }
 
+function getAdminInquiries() {
+  return db.prepare("SELECT * FROM inquiries ORDER BY id DESC LIMIT 100").all();
+}
+
 function logAudit(req, actionType, targetType, targetId, details = "") {
   const result = db.prepare(`
     INSERT INTO admin_audit_logs (action_type, target_type, target_id, details, ip_address, created_at)
@@ -540,6 +625,7 @@ function setCookie(res, name, value, options = {}) {
   if (options.maxAge) parts.push(`Max-Age=${options.maxAge}`);
   if (options.httpOnly) parts.push("HttpOnly");
   if (options.sameSite) parts.push(`SameSite=${options.sameSite}`);
+  if (IS_PRODUCTION) parts.push("Secure");
   parts.push("Path=/");
   const existing = res.getHeader("Set-Cookie") || [];
   res.setHeader("Set-Cookie", Array.isArray(existing) ? existing.concat(parts.join("; ")) : [existing, parts.join("; ")]);
@@ -571,8 +657,17 @@ function fixedIsAdmin(req) {
   return sig.length === expected.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
 }
 
+function securityHeaders(headers = {}) {
+  return {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "X-Frame-Options": "SAMEORIGIN",
+    ...headers
+  };
+}
+
 function send(res, status, body, headers = {}) {
-  res.writeHead(status, headers);
+  res.writeHead(status, securityHeaders(headers));
   res.end(body);
 }
 
@@ -595,6 +690,7 @@ function escapeHtml(value = "") {
 
 function layout(title, content, req) {
   const admin = fixedIsAdmin(req);
+  const csrfToken = escapeHtml(req.csrfToken || "");
   const nav = [
     ["/", "Home"],
     ["/products", "Products"],
@@ -608,6 +704,7 @@ function layout(title, content, req) {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${escapeHtml(title)} | Shaw Enterprise</title>
+  <meta name="csrf-token" content="${csrfToken}" />
   <link rel="stylesheet" href="/styles.css" />
   <script defer src="/client.js"></script>
 </head>
@@ -713,6 +810,7 @@ function ContactPage(req) {
     <section class="page-title compact"><p class="eyebrow">Contact</p><h1>Send an enquiry for pricing, stock, or bulk supply.</h1></section>
     <section class="contact-layout">
       <form class="contact-form" method="post" action="/contact">
+        <input type="hidden" name="_csrf" value="${escapeHtml(req.csrfToken || "")}" />
         <label>Name<input name="name" required /></label>
         <label>Email<input name="email" type="email" required /></label>
         <label>Phone<input name="phone" required /></label>
@@ -738,6 +836,7 @@ function LoginPage(req, error = "") {
         <img src="/logo.svg" alt="Shaw Enterprise" />
         <h1>Admin Login</h1>
         ${error ? `<p class="error">${escapeHtml(error)}</p>` : ""}
+        <input type="hidden" name="_csrf" value="${escapeHtml(req.csrfToken || "")}" />
         <label>Username<input name="username" autocomplete="username" required /></label>
         <label>Password<input name="password" type="password" autocomplete="current-password" required /></label>
         <button class="button primary" type="submit">Login</button>
@@ -747,7 +846,6 @@ function LoginPage(req, error = "") {
 }
 
 function AdminPage(req) {
-  const inquiries = db.prepare("SELECT * FROM inquiries ORDER BY id DESC LIMIT 50").all();
   return layout("Admin", `
     <section class="admin-shell">
       <div class="admin-head">
@@ -780,7 +878,7 @@ function AdminPage(req) {
       </section>
       <section class="admin-section">
         <h2>Inquiries</h2>
-        <div class="admin-list">${inquiries.map((item) => `<article><strong>${escapeHtml(item.name)}</strong><p>${escapeHtml(item.message)}</p><small>${escapeHtml(item.email)} | ${escapeHtml(item.phone)}</small></article>`).join("") || "<p>No inquiries yet.</p>"}</div>
+        <div id="adminInquiries" class="admin-list"></div>
       </section>
       <section class="admin-section">
         <h2>Audit Log</h2>
@@ -826,6 +924,32 @@ function hashOtp(otp) {
   return crypto.createHash("sha256").update(`${otp}:${SESSION_SECRET}`).digest("hex");
 }
 
+function healthPayload() {
+  const productCount = db.prepare("SELECT COUNT(*) AS count FROM products").get().count;
+  return {
+    ok: true,
+    service: "shaw-enterprise",
+    environment: NODE_ENV,
+    sqlite: { ok: true, path: DB_PATH, products: productCount },
+    mysqlSync: { enabled: MYSQL_SYNC_ENABLED, configured: Boolean(MYSQL_PASSWORD) },
+    email: { provider: EMAIL_PROVIDER, configured: EMAIL_PROVIDER !== "dev" || !IS_PRODUCTION },
+    checkedAt: nowSql()
+  };
+}
+
+function deliverOtp(email, otp) {
+  if (EMAIL_PROVIDER === "dev") {
+    if (IS_PRODUCTION) return { ok: false, error: "Email provider is not configured" };
+    console.log(`Local test OTP for ${email}: ${otp}`);
+    return { ok: true, devOtp: otp };
+  }
+  if (EMAIL_PROVIDER === "console") {
+    console.log(`OTP email from ${EMAIL_FROM} to ${email}: ${otp}`);
+    return { ok: true };
+  }
+  return { ok: false, error: `Unsupported EMAIL_PROVIDER: ${EMAIL_PROVIDER}` };
+}
+
 function imageSvg(label, color) {
   return `<svg width="900" height="620" viewBox="0 0 900 620" fill="none" xmlns="http://www.w3.org/2000/svg"><rect width="900" height="620" fill="${color}"/><path d="M0 480C165 395 281 534 435 455C592 375 682 428 900 318V620H0V480Z" fill="rgba(15,47,46,.13)"/><rect x="70" y="70" width="760" height="480" rx="38" fill="rgba(255,255,255,.75)"/><circle cx="450" cy="260" r="128" fill="#0F2F2E" opacity=".12"/><text x="450" y="292" text-anchor="middle" fill="#0F2F2E" font-family="Georgia,serif" font-size="54" font-weight="700">${label}</text><text x="450" y="365" text-anchor="middle" fill="#304B49" font-family="Verdana,sans-serif" font-size="22">Shaw Enterprise</text></svg>`;
 }
@@ -835,7 +959,10 @@ initDb();
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
+    if (req.method === "GET" && url.pathname === "/healthz") return json(res, 200, healthPayload());
+
     const visitor = getVisitor(req, res);
+    req.csrfToken = getCsrfToken(req, res);
 
     if (url.pathname.startsWith("/images/")) {
       const imageName = url.pathname.toLowerCase();
@@ -865,7 +992,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/contact") return send(res, 200, ContactPage(req), { "Content-Type": "text/html; charset=utf-8" });
     if (req.method === "GET" && url.pathname === "/wholesale") return send(res, 302, "", { Location: "/products" });
     if (req.method === "POST" && url.pathname === "/contact") {
+      if (!rateLimit(req, "contact", { limit: 8, windowMs: 10 * 60 * 1000 })) return send(res, 429, ContactPage(req), { "Content-Type": "text/html; charset=utf-8" });
       const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return send(res, 403, ContactPage(req), { "Content-Type": "text/html; charset=utf-8" });
       const result = saveInquiry(data);
       if (result.error) return send(res, 400, ContactPage(req), { "Content-Type": "text/html; charset=utf-8" });
       return send(res, 302, "", { Location: "/contact?sent=1" });
@@ -873,7 +1002,9 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/login") return send(res, 200, LoginPage(req), { "Content-Type": "text/html; charset=utf-8" });
     if (req.method === "POST" && url.pathname === "/login") {
+      if (!rateLimit(req, "login", { limit: 10, windowMs: 10 * 60 * 1000 })) return send(res, 429, LoginPage(req, "Too many login attempts. Try again shortly."), { "Content-Type": "text/html; charset=utf-8" });
       const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return send(res, 403, LoginPage(req, "Security token expired. Reload and try again."), { "Content-Type": "text/html; charset=utf-8" });
       if (data.username === ADMIN_USER && data.password === ADMIN_PASSWORD) {
         setCookie(res, "shaw_admin", sessionToken(), { maxAge: 60 * 60 * 8, httpOnly: true, sameSite: "Lax" });
         logAudit(req, "login", "admin", ADMIN_USER, "Admin login successful");
@@ -894,7 +1025,10 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/api/products") return json(res, 200, { products: getProducts() });
     if (req.method === "POST" && url.pathname === "/api/inquiries") {
-      const result = saveInquiry(await readBody(req));
+      if (!rateLimit(req, "api-inquiries", { limit: 8, windowMs: 10 * 60 * 1000 })) return json(res, 429, { error: "Too many enquiries. Try again shortly." });
+      const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+      const result = saveInquiry(data);
       if (result.error) return json(res, 400, { error: result.error });
       return json(res, 201, { inquiry: result.inquiry, message: "Enquiry saved" });
     }
@@ -906,18 +1040,23 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url.pathname === "/api/feedback/request-otp") {
+      if (!rateLimit(req, "otp", { limit: 5, windowMs: 10 * 60 * 1000 })) return json(res, 429, { error: "Too many OTP requests. Try again shortly." });
       const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
       const email = String(data.email || "").trim().toLowerCase();
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json(res, 400, { error: "Valid email is required" });
       const otp = String(Math.floor(100000 + Math.random() * 900000));
       const result = db.prepare("INSERT INTO feedback_identity_otps (visitor_id, email, otp_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)")
         .run(visitor.id, email, hashOtp(otp), new Date(Date.now() + 10 * 60 * 1000).toISOString(), nowSql());
       mysqlSyncOtp(db.prepare("SELECT * FROM feedback_identity_otps WHERE id = ?").get(result.lastInsertRowid));
-      return json(res, 200, { message: "OTP generated for local testing", devOtp: otp });
+      const delivery = deliverOtp(email, otp);
+      if (!delivery.ok) return json(res, 503, { error: delivery.error });
+      return json(res, 200, { message: "OTP sent", ...(delivery.devOtp ? { devOtp: delivery.devOtp } : {}) });
     }
 
     if (req.method === "POST" && url.pathname === "/api/feedback/verify-otp") {
       const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
       const email = String(data.email || "").trim().toLowerCase();
       const otp = String(data.otp || "").trim();
       const row = db.prepare(`
@@ -947,7 +1086,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url.pathname === "/api/feedback") {
+      if (!rateLimit(req, "feedback", { limit: 20, windowMs: 10 * 60 * 1000 })) return json(res, 429, { error: "Too many feedback posts. Try again shortly." });
       const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
       const identity = getIdentity(visitor.id);
       if (!identity?.verified) return json(res, 403, { error: "Please verify your email before posting" });
       const message = String(data.message || "").trim();
@@ -965,6 +1106,7 @@ const server = http.createServer(async (req, res) => {
     const reactionMatch = url.pathname.match(/^\/api\/feedback\/(\d+)\/react$/);
     if (req.method === "POST" && reactionMatch) {
       const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
       const id = Number(reactionMatch[1]);
       const reaction = data.reaction === "heart" ? "heart" : "like";
       const existing = db.prepare("SELECT * FROM feedback_reactions WHERE feedback_id = ? AND visitor_id = ?").get(id, visitor.id);
@@ -985,9 +1127,13 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname.startsWith("/api/admin/")) {
       if (!requireAdmin(req, res)) return;
+      if (!["GET", "HEAD", "OPTIONS"].includes(req.method) && !rateLimit(req, "admin-write", { limit: 60, windowMs: 10 * 60 * 1000 })) {
+        return json(res, 429, { error: "Too many admin changes. Try again shortly." });
+      }
       if (req.method === "GET" && url.pathname === "/api/admin/products") return json(res, 200, { products: getProducts() });
       if (req.method === "POST" && url.pathname === "/api/admin/products") {
         const data = await readBody(req);
+        if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
         const error = validateProduct(data);
         if (error) return json(res, 400, { error });
         const p = productPayload(data);
@@ -1002,6 +1148,7 @@ const server = http.createServer(async (req, res) => {
       const adminProductMatch = url.pathname.match(/^\/api\/admin\/products\/(\d+)$/);
       if (adminProductMatch && req.method === "PUT") {
         const data = await readBody(req);
+        if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
         const error = validateProduct(data);
         if (error) return json(res, 400, { error });
         const id = Number(adminProductMatch[1]);
@@ -1015,15 +1162,26 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { products: getProducts(), auditLogs: getAuditLogs() });
       }
       if (adminProductMatch && req.method === "DELETE") {
+        if (!validateCsrf(req, req.csrfToken)) return json(res, 403, { error: "Security token expired. Reload and try again." });
         const id = Number(adminProductMatch[1]);
         db.prepare("DELETE FROM products WHERE id = ?").run(id);
         mysqlDeleteProduct(id);
         logAudit(req, "delete", "product", id, "Product deleted");
         return json(res, 200, { products: getProducts(), auditLogs: getAuditLogs() });
       }
+      if (req.method === "GET" && url.pathname === "/api/admin/inquiries") return json(res, 200, { inquiries: getAdminInquiries(), auditLogs: getAuditLogs() });
+      const inquiryStatusMatch = url.pathname.match(/^\/api\/admin\/inquiries\/(\d+)\/status$/);
+      if (inquiryStatusMatch && req.method === "POST") {
+        const data = await readBody(req);
+        if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+        const result = updateInquiryStatus(req, Number(inquiryStatusMatch[1]), String(data.status || ""));
+        if (result.error) return json(res, result.statusCode || 400, { error: result.error });
+        return json(res, 200, { inquiries: getAdminInquiries(), auditLogs: getAuditLogs() });
+      }
       if (req.method === "GET" && url.pathname === "/api/admin/feedback") return json(res, 200, { feedback: getAdminFeedback(), auditLogs: getAuditLogs() });
       const hideMatch = url.pathname.match(/^\/api\/admin\/feedback\/(\d+)\/hide$/);
       if (hideMatch && req.method === "POST") {
+        if (!validateCsrf(req, req.csrfToken)) return json(res, 403, { error: "Security token expired. Reload and try again." });
         const id = Number(hideMatch[1]);
         const row = db.prepare("SELECT status FROM feedback_comments WHERE id = ?").get(id);
         const status = row?.status === "hidden" ? "visible" : "hidden";
@@ -1034,6 +1192,7 @@ const server = http.createServer(async (req, res) => {
       }
       const deleteFeedbackMatch = url.pathname.match(/^\/api\/admin\/feedback\/(\d+)$/);
       if (deleteFeedbackMatch && req.method === "DELETE") {
+        if (!validateCsrf(req, req.csrfToken)) return json(res, 403, { error: "Security token expired. Reload and try again." });
         const id = Number(deleteFeedbackMatch[1]);
         db.prepare("DELETE FROM feedback_comments WHERE id = ?").run(id);
         mysqlDeleteFeedback(id);
