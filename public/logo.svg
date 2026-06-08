@@ -1,0 +1,7 @@
+<svg width="220" height="64" viewBox="0 0 220 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="220" height="64" rx="12" fill="#0F2F2E"/>
+  <circle cx="34" cy="32" r="18" fill="#E2B45A"/>
+  <path d="M27 39C32 25 43 24 48 30C42 30 36 34 34 43C32 42 29 41 27 39Z" fill="#0F2F2E"/>
+  <text x="64" y="30" fill="#F8F1E3" font-family="Georgia, serif" font-size="20" font-weight="700">Shaw</text>
+  <text x="64" y="48" fill="#E2B45A" font-family="Verdana, sans-serif" font-size="13" letter-spacing="2">ENTERPRISE</text>
+</svg>

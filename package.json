@@ -1,0 +1,18 @@
+{
+  "name": "shaw-enterprise",
+  "version": "1.0.0",
+  "description": "Professional full-stack website for Shaw Enterprise.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": [
+    "shaw-enterprise",
+    "wholesale",
+    "retail",
+    "disposable-products"
+  ],
+  "author": "Shaw Enterprise",
+  "license": "UNLICENSED"
+}
