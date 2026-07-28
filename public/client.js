@@ -558,6 +558,10 @@ function renderAuditLog(items) {
 }
 
 async function refreshAdmin() {
+  if (qs("#auditLog")) {
+    const audits = await fetchJson("/api/admin/audits");
+    renderAuditLog(audits.auditLogs);
+  }
   if (qs("#adminProducts")) {
     const products = await fetchJson("/api/admin/products");
     renderAdminProducts(products.products);

@@ -172,6 +172,14 @@ test("public routes, enquiries, admin inquiry status, feedback, moderation, and 
     const admin = await request(port, jar, "GET", "/admin");
     assert.equal(admin.status, 200);
 
+    const auditsPage = await request(port, jar, "GET", "/admin/audits");
+    assert.equal(auditsPage.status, 200);
+    assert.match(auditsPage.text, /id="auditLog"/);
+
+    const audits = await request(port, jar, "GET", "/api/admin/audits");
+    assert.equal(audits.status, 200);
+    assert.ok(audits.json.auditLogs.some((item) => item.action_type === "login"));
+
     const inquiries = await request(port, jar, "GET", "/api/admin/inquiries");
     assert.equal(inquiries.status, 200);
     assert.equal(inquiries.json.inquiries[0].status, "new");
