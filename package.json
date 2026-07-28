@@ -1,0 +1,22 @@
+{
+  "name": "shaw-enterprise",
+  "version": "1.0.0",
+  "description": "Professional full-stack website for Shaw Enterprise.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --experimental-sqlite server.js",
+    "dev": "node --experimental-sqlite server.js",
+    "test": "node --test tests/*.test.js",
+    "db:backup": "node --experimental-sqlite scripts/backup-sqlite.js",
+    "db:export:mysql": "node --experimental-sqlite scripts/export-mysql-database.js",
+    "db:sync:mysql": "node --experimental-sqlite scripts/sync-mysql-from-sqlite.js"
+  },
+  "keywords": [
+    "shaw-enterprise",
+    "wholesale",
+    "retail",
+    "disposable-products"
+  ],
+  "author": "Shaw Enterprise",
+  "license": "UNLICENSED"
+}

@@ -1,0 +1,1628 @@
+const http = require("node:http");
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { spawnSync } = require("node:child_process");
+const { DatabaseSync } = require("node:sqlite");
+
+const PORT = Number(process.env.PORT || 3000);
+const NODE_ENV = process.env.NODE_ENV || "development";
+const IS_PRODUCTION = NODE_ENV === "production";
+const ROOT = __dirname;
+const PUBLIC_DIR = path.join(ROOT, "public");
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(ROOT, "data");
+const DB_PATH = path.join(DATA_DIR, "shaw-enterprise.db");
+const MYSQL_SYNC_PATH = path.join(DATA_DIR, "mysql-live-sync.sql");
+
+function loadEnvFile() {
+  const envPath = path.join(ROOT, ".env");
+  if (!fs.existsSync(envPath)) return;
+  const lines = fs.readFileSync(envPath, "utf8").split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const index = trimmed.indexOf("=");
+    if (index === -1) continue;
+    const key = trimmed.slice(0, index).trim();
+    const value = trimmed.slice(index + 1).trim().replace(/^["']|["']$/g, "");
+    if (!process.env[key]) process.env[key] = value;
+  }
+}
+
+loadEnvFile();
+
+const ADMIN_USER = process.env.ADMIN_USER || "admin";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "change-me-now";
+const SESSION_SECRET = process.env.SESSION_SECRET || "local-dev-secret-change-before-production";
+const MYSQL_HOST = process.env.MYSQL_HOST || "localhost";
+const MYSQL_USER = process.env.MYSQL_USER || "root";
+const MYSQL_PASSWORD = process.env.MYSQL_PASSWORD || "";
+const MYSQL_DATABASE = process.env.MYSQL_DATABASE || "shaw_enterprise";
+const MYSQL_BIN = process.env.MYSQL_BIN || "mysql";
+const MYSQL_SYNC_ENABLED = process.env.MYSQL_SYNC_ENABLED ? process.env.MYSQL_SYNC_ENABLED === "true" : Boolean(MYSQL_PASSWORD);
+const EMAIL_PROVIDER = process.env.EMAIL_PROVIDER || "dev";
+const SMS_PROVIDER = process.env.SMS_PROVIDER || "dev";
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || `http://localhost:${PORT}/auth/google/callback`;
+const CSRF_TOKEN_TTL_MS = 60 * 60 * 1000;
+const rateLimits = new Map();
+
+const settings = {
+  phone: process.env.BUSINESS_PHONE || "+91 00000 00000",
+  email: process.env.BUSINESS_EMAIL || "sales@shawenterprise.example",
+  address: process.env.BUSINESS_ADDRESS || "Your shop address, city, state",
+  whatsapp: process.env.WHATSAPP_NUMBER || "910000000000"
+};
+const EMAIL_FROM = process.env.EMAIL_FROM || settings.email;
+
+function validateStartupConfig() {
+  const errors = [];
+  if (!Number.isInteger(PORT) || PORT <= 0) errors.push("PORT must be a positive integer");
+  if (IS_PRODUCTION) {
+    if (!process.env.ADMIN_USER || !process.env.ADMIN_PASSWORD) errors.push("ADMIN_USER and ADMIN_PASSWORD are required in production");
+    if (ADMIN_PASSWORD === "change-me-now" || ADMIN_PASSWORD.length < 12) errors.push("ADMIN_PASSWORD must be changed and at least 12 characters in production");
+    if (!process.env.SESSION_SECRET || SESSION_SECRET.length < 32 || SESSION_SECRET === "local-dev-secret-change-before-production") errors.push("SESSION_SECRET must be set to a strong 32+ character value in production");
+    if (EMAIL_PROVIDER === "dev") errors.push("EMAIL_PROVIDER must be configured in production");
+  }
+  if (MYSQL_SYNC_ENABLED && !MYSQL_PASSWORD) {
+    console.warn("MySQL live sync disabled until MYSQL_PASSWORD is provided.");
+  }
+  if (errors.length) {
+    throw new Error(`Startup configuration invalid:\n- ${errors.join("\n- ")}`);
+  }
+}
+
+validateStartupConfig();
+fs.mkdirSync(DATA_DIR, { recursive: true });
+const db = new DatabaseSync(DB_PATH);
+db.exec("PRAGMA foreign_keys = ON");
+
+const nowSql = () => new Date().toISOString();
+const randomId = () => crypto.randomBytes(12).toString("hex");
+const parseJson = (value, fallback = []) => {
+  try {
+    return value ? JSON.parse(value) : fallback;
+  } catch {
+    return fallback;
+  }
+};
+
+function mysqlDate(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value).replace("T", " ").replace("Z", "").slice(0, 19);
+  return date.toISOString().slice(0, 19).replace("T", " ");
+}
+
+function mysqlEscape(value) {
+  if (value === null || value === undefined || value === "") return "NULL";
+  return `'${String(value).replace(/\\/g, "\\\\").replace(/'/g, "''")}'`;
+}
+
+function mysqlBool(value) {
+  return value ? 1 : 0;
+}
+
+function mysqlRun(sql) {
+  if (!MYSQL_SYNC_ENABLED || !MYSQL_PASSWORD) return false;
+  const wrapped = `USE \`${MYSQL_DATABASE}\`;\nSET FOREIGN_KEY_CHECKS = 1;\n${sql}\n`;
+  fs.writeFileSync(MYSQL_SYNC_PATH, wrapped, "utf8");
+  const args = ["-h", MYSQL_HOST, "-u", MYSQL_USER, `--database=${MYSQL_DATABASE}`];
+  const options = {
+    cwd: ROOT,
+    env: { ...process.env, MYSQL_PWD: MYSQL_PASSWORD },
+    input: wrapped,
+    encoding: "utf8"
+  };
+  let result = spawnSync(MYSQL_BIN, args, options);
+  if (result.error?.code === "ENOENT" && MYSQL_BIN !== "mysql") {
+    console.warn(`Configured MySQL client was not found at ${MYSQL_BIN}; retrying with mysql from PATH.`);
+    result = spawnSync("mysql", args, options);
+  }
+  if (result.status !== 0) {
+    console.error("MySQL live sync failed:", result.stderr || result.stdout || result.error?.message || "Unknown MySQL client error");
+  }
+  return result.status === 0;
+}
+
+function mysqlEnsureCategory(category) {
+  mysqlRun(`
+    INSERT INTO product_categories (name, description)
+    VALUES (${mysqlEscape(category)}, ${mysqlEscape(`${category} products for Shaw Enterprise catalog`)})
+    ON DUPLICATE KEY UPDATE description = VALUES(description);
+  `);
+}
+
+function mysqlSyncProduct(product) {
+  if (!product) return;
+  mysqlEnsureCategory(product.category);
+  const images = parseJson(product.images_json, []);
+  mysqlRun(`
+    INSERT INTO products
+      (id, category_id, name, sku, price_label, product_type, summary, details, pack_size, audience, featured, status, created_at, updated_at)
+    SELECT ${product.id}, id, ${mysqlEscape(product.name)}, ${mysqlEscape(`SE-${String(product.id).padStart(4, "0")}`)}, ${mysqlEscape(product.price)}, ${mysqlEscape(product.product_type)}, ${mysqlEscape(product.summary)}, ${mysqlEscape(product.details)}, ${mysqlEscape(product.pack_size)}, ${mysqlEscape(product.audience)}, ${mysqlBool(product.featured)}, 'active', ${mysqlEscape(mysqlDate(product.created_at))}, ${mysqlEscape(mysqlDate(product.updated_at))}
+    FROM product_categories WHERE name = ${mysqlEscape(product.category)}
+    ON DUPLICATE KEY UPDATE
+      category_id = VALUES(category_id),
+      name = VALUES(name),
+      sku = VALUES(sku),
+      price_label = VALUES(price_label),
+      product_type = VALUES(product_type),
+      summary = VALUES(summary),
+      details = VALUES(details),
+      pack_size = VALUES(pack_size),
+      audience = VALUES(audience),
+      featured = VALUES(featured),
+      status = 'active',
+      updated_at = VALUES(updated_at);
+    DELETE FROM product_images WHERE product_id = ${product.id};
+    ${images.map((image, index) => `INSERT INTO product_images (product_id, image_data, alt_text, sort_order) VALUES (${product.id}, ${mysqlEscape(image)}, ${mysqlEscape(product.name)}, ${index});`).join("\n")}
+  `);
+}
+
+function mysqlDeleteProduct(id) {
+  mysqlRun(`DELETE FROM products WHERE id = ${Number(id)};`);
+}
+
+function mysqlSyncInquiry(row) {
+  mysqlRun(`
+    INSERT INTO inquiries (id, name, email, phone, message, status, created_at)
+    VALUES (${row.id}, ${mysqlEscape(row.name)}, ${mysqlEscape(row.email)}, ${mysqlEscape(row.phone)}, ${mysqlEscape(row.message)}, ${mysqlEscape(row.status || "new")}, ${mysqlEscape(mysqlDate(row.created_at))})
+    ON DUPLICATE KEY UPDATE name = VALUES(name), email = VALUES(email), phone = VALUES(phone), message = VALUES(message), status = VALUES(status), created_at = VALUES(created_at);
+  `);
+}
+
+function saveInquiry(data) {
+  const name = String(data.name || "").trim();
+  const email = String(data.email || "").trim();
+  const phone = String(data.phone || "").trim();
+  const message = String(data.message || "").trim();
+  if (!name || !email || !phone || !message) return { error: "All inquiry fields are required" };
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return { error: "Valid email is required" };
+  const result = db.prepare("INSERT INTO inquiries (name, email, phone, message, created_at) VALUES (?, ?, ?, ?, ?)").run(name, email, phone, message, nowSql());
+  const inquiry = db.prepare("SELECT * FROM inquiries WHERE id = ?").get(result.lastInsertRowid);
+  mysqlSyncInquiry(inquiry);
+  return { inquiry };
+}
+
+function updateInquiryStatus(req, id, status) {
+  if (!["new", "contacted", "closed"].includes(status)) return { error: "Invalid inquiry status" };
+  const existing = db.prepare("SELECT * FROM inquiries WHERE id = ?").get(id);
+  if (!existing) return { error: "Inquiry not found", statusCode: 404 };
+  db.prepare("UPDATE inquiries SET status = ? WHERE id = ?").run(status, id);
+  const inquiry = db.prepare("SELECT * FROM inquiries WHERE id = ?").get(id);
+  mysqlSyncInquiry(inquiry);
+  logAudit(req, "update_status", "inquiry", id, `Inquiry marked ${status}`);
+  return { inquiry };
+}
+
+function mysqlSyncOtp(row) {
+  mysqlRun(`
+    INSERT INTO feedback_identity_otps (id, visitor_id, email, otp_hash, expires_at, used_at, created_at)
+    VALUES (${row.id}, ${mysqlEscape(row.visitor_id)}, ${mysqlEscape(row.email)}, ${mysqlEscape(row.otp_hash)}, ${mysqlEscape(mysqlDate(row.expires_at))}, ${mysqlEscape(mysqlDate(row.used_at))}, ${mysqlEscape(mysqlDate(row.created_at))})
+    ON DUPLICATE KEY UPDATE used_at = VALUES(used_at), expires_at = VALUES(expires_at);
+  `);
+}
+
+function mysqlSyncIdentity(row) {
+  mysqlRun(`
+    INSERT INTO feedback_identities (visitor_id, email, verified, created_at, updated_at)
+    VALUES (${mysqlEscape(row.visitor_id)}, ${mysqlEscape(row.email)}, ${mysqlBool(row.verified)}, ${mysqlEscape(mysqlDate(row.created_at))}, ${mysqlEscape(mysqlDate(row.updated_at))})
+    ON DUPLICATE KEY UPDATE email = VALUES(email), verified = VALUES(verified), updated_at = VALUES(updated_at);
+  `);
+}
+
+function mysqlSyncFeedback(row) {
+  mysqlRun(`
+    INSERT INTO feedback_comments (id, visitor_id, author_email, message, parent_id, product_id, status, created_at)
+    VALUES (${row.id}, ${mysqlEscape(row.visitor_id)}, ${mysqlEscape(row.author_email)}, ${mysqlEscape(row.message)}, ${row.parent_id || "NULL"}, ${row.product_id || "NULL"}, ${mysqlEscape(row.status)}, ${mysqlEscape(mysqlDate(row.created_at))})
+    ON DUPLICATE KEY UPDATE message = VALUES(message), status = VALUES(status), product_id = VALUES(product_id);
+  `);
+}
+
+function mysqlDeleteFeedback(id) {
+  mysqlRun(`DELETE FROM feedback_comments WHERE id = ${Number(id)};`);
+}
+
+function mysqlSyncReaction(row) {
+  mysqlRun(`
+    INSERT INTO feedback_reactions (id, feedback_id, visitor_id, reaction, created_at)
+    VALUES (${row.id}, ${row.feedback_id}, ${mysqlEscape(row.visitor_id)}, ${mysqlEscape(row.reaction)}, ${mysqlEscape(mysqlDate(row.created_at))})
+    ON DUPLICATE KEY UPDATE reaction = VALUES(reaction), created_at = VALUES(created_at);
+  `);
+}
+
+function mysqlDeleteReaction(id) {
+  mysqlRun(`DELETE FROM feedback_reactions WHERE id = ${Number(id)};`);
+}
+
+function mysqlSyncAudit(row) {
+  mysqlRun(`
+    INSERT INTO admin_audit_logs (id, action_type, target_type, target_id, details, ip_address, created_at)
+    VALUES (${row.id}, ${mysqlEscape(row.action_type)}, ${mysqlEscape(row.target_type)}, ${mysqlEscape(row.target_id)}, ${mysqlEscape(row.details)}, ${mysqlEscape(row.ip_address)}, ${mysqlEscape(mysqlDate(row.created_at))})
+    ON DUPLICATE KEY UPDATE details = VALUES(details), created_at = VALUES(created_at);
+  `);
+}
+
+const catalogBlueprints = [
+  {
+    category: "Cups",
+    names: ["Ripple Paper Cup", "Plain Paper Cup", "Printed Tea Cup", "Double Wall Coffee Cup", "Cold Drink Paper Cup", "Kulhad Style Cup"],
+    type: "Hot and cold beverage disposable",
+    pack: "50 pcs, 100 pcs, bulk carton",
+    audience: "Tea stalls, cafes, offices, caterers",
+    summary: "Disposable cups for tea, coffee, juice, events, and counters.",
+    details: "Food-grade disposable cups with dependable rim strength, practical insulation, and supply-ready packing for retail shelves and wholesale cartons.",
+    basePrice: 68
+  },
+  {
+    category: "Plates",
+    names: ["Round Paper Plate", "Compartment Meal Plate", "Silver Laminated Plate", "Snack Paper Plate", "Heavy Duty Dinner Plate", "Eco Bagasse Plate"],
+    type: "Meal serving disposable",
+    pack: "100 pcs, 500 pcs, wholesale carton",
+    audience: "Caterers, households, event managers, retailers",
+    summary: "Strong disposable plates for meals, snacks, events, and food counters.",
+    details: "Sturdy disposable plates for practical food service, designed for easy stacking, quick serving, and reliable handling in events and retail sale.",
+    basePrice: 90
+  },
+  {
+    category: "Containers",
+    names: ["Round Food Container", "Rectangular Meal Box", "Clear Lid Container", "Sauce Cup Container", "Bakery Clamshell Box", "Microwave Safe Container"],
+    type: "Takeaway packaging",
+    pack: "25 pcs, 100 pcs, carton packs",
+    audience: "Restaurants, cloud kitchens, bakeries, sweet shops",
+    summary: "Food containers for takeaway, delivery, storage, and display.",
+    details: "Stackable food containers with secure closure options for takeaway counters, food delivery, sweets, bakery products, and daily kitchen operations.",
+    basePrice: 115
+  },
+  {
+    category: "Cutlery",
+    names: ["Wooden Spoon Pack", "Disposable Fork Pack", "Dessert Spoon Pack", "Ice Cream Spoon Pack", "Knife Pack", "Mixed Cutlery Kit"],
+    type: "Disposable cutlery",
+    pack: "100 pcs, 500 pcs, mixed carton",
+    audience: "Food counters, event planners, tasting counters",
+    summary: "Clean disposable spoons, forks, knives, and serving cutlery.",
+    details: "Smooth finish disposable cutlery suitable for events, takeaway orders, pantry supply, retail counters, and tasting or sampling counters.",
+    basePrice: 42
+  },
+  {
+    category: "Napkins",
+    names: ["Tissue Napkin Pack", "Printed Napkin", "Dinner Napkin", "Cocktail Napkin", "Soft Table Tissue", "Dispenser Tissue"],
+    type: "Table hygiene disposable",
+    pack: "100 pcs, 200 pcs, carton packs",
+    audience: "Restaurants, offices, hotels, party suppliers",
+    summary: "Soft napkins and tissues for tables, counters, and events.",
+    details: "Clean, absorbent napkins for food service and retail use, with multiple pack sizes for daily operations and wholesale customers.",
+    basePrice: 38
+  },
+  {
+    category: "Bags",
+    names: ["Paper Carry Bag", "Kraft Grocery Bag", "Food Delivery Bag", "Bakery Paper Bag", "Gift Paper Bag", "Retail Counter Bag"],
+    type: "Carry and retail packaging",
+    pack: "25 pcs, 100 pcs, bulk carton",
+    audience: "Retail shops, bakeries, groceries, restaurants",
+    summary: "Paper carry bags for packing, delivery, and retail counters.",
+    details: "Durable paper bags for shop counters and takeaway use, available in practical sizes for food packets, groceries, bakery, and gifting.",
+    basePrice: 130
+  },
+  {
+    category: "Straws",
+    names: ["Paper Straw Pack", "Bendy Straw Pack", "Milkshake Straw", "Wrapped Straw", "Cocktail Straw", "Jumbo Drink Straw"],
+    type: "Drink service disposable",
+    pack: "100 pcs, 250 pcs, bulk carton",
+    audience: "Juice shops, cafes, restaurants, event counters",
+    summary: "Disposable straws for cold drinks, shakes, and event service.",
+    details: "Convenient straw packs for drink counters, available in different sizes for juices, milkshakes, cold coffee, parties, and retail sale.",
+    basePrice: 35
+  },
+  {
+    category: "Bowls",
+    names: ["Paper Soup Bowl", "Salad Bowl", "Dessert Bowl", "Rice Bowl", "Noodle Bowl", "Laminated Snack Bowl"],
+    type: "Bowl serving disposable",
+    pack: "50 pcs, 100 pcs, carton packs",
+    audience: "Caterers, restaurants, food stalls, events",
+    summary: "Disposable bowls for soups, snacks, rice, desserts, and salads.",
+    details: "Strong bowl options for hot and cold food service, designed for counters, catering, parties, restaurant packing, and wholesale supply.",
+    basePrice: 70
+  }
+];
+
+function generatedProductImage(category, index, variant = 1) {
+  return `/images/generated-${category.toLowerCase()}-${index}-${variant}.svg`;
+}
+
+function buildCatalogProduct(index) {
+  const blueprint = catalogBlueprints[index % catalogBlueprints.length];
+  const name = blueprint.names[Math.floor(index / catalogBlueprints.length) % blueprint.names.length];
+  const size = ["Small", "Medium", "Large", "Premium", "Economy"][index % 5];
+  const packCount = [25, 50, 100, 200, 500][index % 5];
+  const price = blueprint.basePrice + (index % 17) * 7 + Math.floor(index / 20) * 3;
+  const productName = `${size} ${name} ${String(index + 1).padStart(3, "0")}`;
+  return [
+    productName,
+    blueprint.category,
+    `Rs. ${price} / ${packCount} pcs`,
+    blueprint.type,
+    blueprint.summary,
+    `${blueprint.details} Item code SE-${String(index + 1).padStart(4, "0")} is suited for regular replenishment and counter-ready presentation.`,
+    blueprint.pack,
+    blueprint.audience,
+    JSON.stringify([generatedProductImage(blueprint.category, index + 1, 1), generatedProductImage(blueprint.category, index + 1, 2), generatedProductImage(blueprint.category, index + 1, 3)]),
+    index < 12 ? 1 : 0,
+    nowSql(),
+    nowSql()
+  ];
+}
+
+function initDb() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS products (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      category TEXT NOT NULL,
+      price TEXT NOT NULL,
+      product_type TEXT NOT NULL DEFAULT 'Retail and wholesale',
+      summary TEXT NOT NULL,
+      details TEXT NOT NULL,
+      pack_size TEXT NOT NULL,
+      audience TEXT NOT NULL,
+      images_json TEXT NOT NULL DEFAULT '[]',
+      featured INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS inquiries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL,
+      phone TEXT NOT NULL,
+      message TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'new',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS feedback_identities (
+      visitor_id TEXT PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE,
+      verified INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS feedback_identity_otps (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      visitor_id TEXT NOT NULL,
+      email TEXT NOT NULL,
+      otp_hash TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used_at TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS feedback_comments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      visitor_id TEXT NOT NULL,
+      author_email TEXT NOT NULL,
+      message TEXT NOT NULL,
+      parent_id INTEGER,
+      product_id INTEGER,
+      status TEXT NOT NULL DEFAULT 'visible',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(parent_id) REFERENCES feedback_comments(id) ON DELETE CASCADE,
+      FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS feedback_reactions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      feedback_id INTEGER NOT NULL,
+      visitor_id TEXT NOT NULL,
+      reaction TEXT NOT NULL CHECK(reaction IN ('like', 'heart')),
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(feedback_id, visitor_id),
+      FOREIGN KEY(feedback_id) REFERENCES feedback_comments(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS admin_audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      action_type TEXT NOT NULL,
+      target_type TEXT NOT NULL,
+      target_id TEXT,
+      details TEXT NOT NULL DEFAULT '',
+      ip_address TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS admin_accounts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT NOT NULL UNIQUE,
+      email TEXT NOT NULL UNIQUE,
+      phone TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      email_verified INTEGER NOT NULL DEFAULT 0,
+      phone_verified INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS admin_auth_codes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id INTEGER,
+      destination TEXT NOT NULL,
+      channel TEXT NOT NULL CHECK(channel IN ('email', 'phone')),
+      purpose TEXT NOT NULL CHECK(purpose IN ('signup', 'reset')),
+      code_hash TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used_at TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(account_id) REFERENCES admin_accounts(id) ON DELETE CASCADE
+    );
+  `);
+
+  const inquiryColumns = db.prepare("PRAGMA table_info(inquiries)").all().map((column) => column.name);
+  if (!inquiryColumns.includes("status")) {
+    db.exec("ALTER TABLE inquiries ADD COLUMN status TEXT NOT NULL DEFAULT 'new'");
+  }
+
+  const productCount = db.prepare("SELECT COUNT(*) AS count FROM products").get().count;
+  const seed = db.prepare(`
+      INSERT INTO products
+      (name, category, price, product_type, summary, details, pack_size, audience, images_json, featured, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+  if (productCount === 0) {
+
+    const products = [
+      ["Ripple Paper Cups", "Cups", "Rs. 95 / 50 pcs", "Hot beverage disposable", "Insulated cups for tea, coffee, and catering counters.", "Triple-layer ripple cups with firm grip, strong rim, and dependable heat resistance for events, offices, food stalls, and cafes.", "50 pcs, 100 pcs, carton packs", "Tea stalls, offices, cafes, events", ["/images/cup-1.svg", "/images/cup-2.svg", "/images/cup-3.svg"], 1],
+      ["Premium Paper Plates", "Plates", "Rs. 120 / 100 pcs", "Meal serving disposable", "Strong round plates for parties and daily food service.", "Leak-resistant disposable plates designed for snacks, meals, religious events, catering, and retail resale counters.", "100 pcs, 500 pcs, bulk carton", "Caterers, households, wholesalers", ["/images/plate-1.svg", "/images/plate-2.svg", "/images/plate-3.svg"], 1],
+      ["Food Container Set", "Containers", "Rs. 180 / 25 pcs", "Takeaway packaging", "Secure containers for restaurant packing and delivery.", "Stackable food containers with fitted lids, suited for rice, curry, snacks, bakery, sweets, and takeaway operations.", "25 pcs, 100 pcs, carton packs", "Restaurants, cloud kitchens, sweet shops", ["/images/container-1.svg", "/images/container-2.svg"], 1],
+      ["Wooden Cutlery Pack", "Cutlery", "Rs. 75 / 100 pcs", "Eco-friendly disposable", "Clean disposable spoons and forks for professional service.", "Smooth finish disposable cutlery for events, takeaway counters, office pantry supply, and food sampling counters.", "100 pcs, 500 pcs, mixed carton", "Event managers, food counters, retailers", ["/images/cutlery-1.svg", "/images/cutlery-2.svg"], 0]
+    ];
+
+    for (const item of products) {
+      seed.run(item[0], item[1], item[2], item[3], item[4], item[5], item[6], item[7], JSON.stringify(item[8]), item[9], nowSql(), nowSql());
+    }
+  }
+
+  const updatedCount = db.prepare("SELECT COUNT(*) AS count FROM products").get().count;
+  for (let index = updatedCount; index < 300; index += 1) {
+    seed.run(...buildCatalogProduct(index));
+  }
+}
+
+function safeEmail(email = "") {
+  const [name, domain] = String(email).split("@");
+  if (!name || !domain) return "Verified customer";
+  return `${name.slice(0, 2)}***@${domain}`;
+}
+
+function productRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    name: row.name,
+    category: row.category,
+    price: row.price,
+    productType: row.product_type,
+    summary: row.summary,
+    details: row.details,
+    packSize: row.pack_size,
+    audience: row.audience,
+    images: parseJson(row.images_json, []),
+    featured: Boolean(row.featured),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function getProducts() {
+  return db.prepare("SELECT * FROM products ORDER BY featured DESC, id ASC").all().map(productRow);
+}
+
+function getProduct(id) {
+  return productRow(db.prepare("SELECT * FROM products WHERE id = ?").get(id));
+}
+
+function getCatalogMetrics() {
+  const totalProducts = db.prepare("SELECT COUNT(*) AS count FROM products").get().count;
+  const categories = db.prepare("SELECT category, COUNT(*) AS count FROM products GROUP BY category ORDER BY count DESC, category ASC").all();
+  const featured = db.prepare("SELECT COUNT(*) AS count FROM products WHERE featured = 1").get().count;
+  const inquiries = db.prepare("SELECT status, COUNT(*) AS count FROM inquiries GROUP BY status").all();
+  const feedback = db.prepare("SELECT COUNT(*) AS count FROM feedback_comments WHERE status = 'visible'").get().count;
+  const newInquiries = inquiries.find((row) => row.status === "new")?.count || 0;
+  const contactedInquiries = inquiries.find((row) => row.status === "contacted")?.count || 0;
+  const closedInquiries = inquiries.find((row) => row.status === "closed")?.count || 0;
+  return {
+    totalProducts,
+    categories,
+    featured,
+    feedback,
+    inquiries: { new: newInquiries, contacted: contactedInquiries, closed: closedInquiries, total: newInquiries + contactedInquiries + closedInquiries },
+    catalogCompletion: totalProducts ? Math.round((featured / totalProducts) * 100) : 0
+  };
+}
+
+function getIdentity(visitorId) {
+  return db.prepare("SELECT * FROM feedback_identities WHERE visitor_id = ?").get(visitorId) || null;
+}
+
+function getVisitor(req, res) {
+  const cookies = parseCookies(req);
+  let id = cookies.visitor_id;
+  if (!id || !/^[a-f0-9]{24}$/.test(id)) {
+    id = randomId();
+    setCookie(res, "visitor_id", id, { maxAge: 60 * 60 * 24 * 365, httpOnly: true, sameSite: "Lax" });
+  }
+  return { id };
+}
+
+function getCsrfToken(req, res) {
+  const cookies = parseCookies(req);
+  let token = cookies.csrf_token;
+  if (!token || !/^[a-f0-9]{48}$/.test(token)) {
+    token = crypto.randomBytes(24).toString("hex");
+    setCookie(res, "csrf_token", token, { maxAge: Math.floor(CSRF_TOKEN_TTL_MS / 1000), sameSite: "Strict" });
+  }
+  return token;
+}
+
+function requestCsrfToken(req) {
+  const token = req.headers["x-csrf-token"];
+  if (typeof token === "string") return token;
+  return "";
+}
+
+function validateCsrf(req, token, body = null) {
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return true;
+  const cookies = parseCookies(req);
+  const submitted = requestCsrfToken(req) || String(body?._csrf || "");
+  return Boolean(cookies.csrf_token && submitted && cookies.csrf_token === submitted && cookies.csrf_token === token);
+}
+
+function rateLimit(req, bucket, options = {}) {
+  const limit = options.limit || 30;
+  const windowMs = options.windowMs || 60 * 1000;
+  const key = `${bucket}:${req.socket.remoteAddress || "unknown"}`;
+  const now = Date.now();
+  const entry = rateLimits.get(key) || { count: 0, resetAt: now + windowMs };
+  if (now > entry.resetAt) {
+    entry.count = 0;
+    entry.resetAt = now + windowMs;
+  }
+  entry.count += 1;
+  rateLimits.set(key, entry);
+  return entry.count <= limit;
+}
+
+function reactionCounts(id) {
+  const rows = db.prepare("SELECT reaction, COUNT(*) AS count FROM feedback_reactions WHERE feedback_id = ? GROUP BY reaction").all(id);
+  return {
+    like: rows.find((row) => row.reaction === "like")?.count || 0,
+    heart: rows.find((row) => row.reaction === "heart")?.count || 0
+  };
+}
+
+function commentDto(row, visitorId) {
+  const reaction = db.prepare("SELECT reaction FROM feedback_reactions WHERE feedback_id = ? AND visitor_id = ?").get(row.id, visitorId);
+  return {
+    id: row.id,
+    visitorId: row.visitor_id,
+    authorEmail: row.author_email,
+    displayLabel: safeEmail(row.author_email),
+    message: row.message,
+    parentId: row.parent_id,
+    productId: row.product_id,
+    status: row.status,
+    createdAt: row.created_at,
+    reactions: reactionCounts(row.id),
+    myReaction: reaction?.reaction || null,
+    replies: []
+  };
+}
+
+function getFeedbackThreads(visitorId, options = {}) {
+  const params = [];
+  const filters = [];
+  if (!options.includeHidden) filters.push("status = 'visible'");
+  if (options.productId === null) {
+    filters.push("product_id IS NULL");
+  } else if (options.productId) {
+    filters.push("product_id = ?");
+    params.push(options.productId);
+  }
+  const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  const rows = db.prepare(`SELECT * FROM feedback_comments ${where} ORDER BY created_at DESC`).all(...params);
+  const byId = new Map(rows.map((row) => [row.id, commentDto(row, visitorId)]));
+  const threads = [];
+  for (const item of byId.values()) {
+    if (item.parentId && byId.has(item.parentId)) byId.get(item.parentId).replies.unshift(item);
+    else threads.push(item);
+  }
+  return threads.sort((a, b) => {
+    const aScore = a.reactions.like + a.reactions.heart * 2 + a.replies.length;
+    const bScore = b.reactions.like + b.reactions.heart * 2 + b.replies.length;
+    if (options.sort === "top") return bScore - aScore || new Date(b.createdAt) - new Date(a.createdAt);
+    return new Date(b.createdAt) - new Date(a.createdAt);
+  });
+}
+
+function getAdminFeedback() {
+  return db.prepare(`
+    SELECT fc.*, p.name AS product_name
+    FROM feedback_comments fc
+    LEFT JOIN products p ON p.id = fc.product_id
+    ORDER BY fc.created_at DESC
+    LIMIT 100
+  `).all().map((row) => ({
+    id: row.id,
+    email: row.author_email,
+    displayLabel: safeEmail(row.author_email),
+    message: row.message,
+    status: row.status,
+    productName: row.product_name || "General feedback",
+    parentId: row.parent_id,
+    createdAt: row.created_at
+  }));
+}
+
+function getAuditLogs() {
+  return db.prepare("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80").all();
+}
+
+function getAdminInquiries() {
+  return db.prepare("SELECT * FROM inquiries ORDER BY id DESC LIMIT 100").all();
+}
+
+function logAudit(req, actionType, targetType, targetId, details = "") {
+  const result = db.prepare(`
+    INSERT INTO admin_audit_logs (action_type, target_type, target_id, details, ip_address, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(actionType, targetType, String(targetId || ""), details, req.socket.remoteAddress || "", nowSql());
+  const row = db.prepare("SELECT * FROM admin_audit_logs WHERE id = ?").get(result.lastInsertRowid);
+  mysqlSyncAudit(row);
+  return row;
+}
+
+function parseCookies(req) {
+  return Object.fromEntries((req.headers.cookie || "").split(";").filter(Boolean).map((part) => {
+    const index = part.indexOf("=");
+    return [part.slice(0, index).trim(), decodeURIComponent(part.slice(index + 1))];
+  }));
+}
+
+function setCookie(res, name, value, options = {}) {
+  const parts = [`${name}=${encodeURIComponent(value)}`];
+  if (options.maxAge) parts.push(`Max-Age=${options.maxAge}`);
+  if (options.httpOnly) parts.push("HttpOnly");
+  if (options.sameSite) parts.push(`SameSite=${options.sameSite}`);
+  if (IS_PRODUCTION) parts.push("Secure");
+  parts.push("Path=/");
+  const existing = res.getHeader("Set-Cookie") || [];
+  res.setHeader("Set-Cookie", Array.isArray(existing) ? existing.concat(parts.join("; ")) : [existing, parts.join("; ")]);
+}
+
+function sessionToken() {
+  const payload = `admin:${Date.now()}`;
+  const sig = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
+  return `${payload}.${sig}`;
+}
+
+function isAdmin(req) {
+  const token = parseCookies(req).shaw_admin;
+  if (!token) return false;
+  const [user, issued, sig] = token.split(".");
+  if (user !== "admin" || !issued || !sig) return false;
+  const expected = crypto.createHmac("sha256", SESSION_SECRET).update(`${user}.${issued}`.replace(".", ":")).digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+}
+
+function fixedIsAdmin(req) {
+  const token = parseCookies(req).shaw_admin;
+  if (!token) return false;
+  const splitAt = token.lastIndexOf(".");
+  if (splitAt < 0) return false;
+  const payload = token.slice(0, splitAt);
+  const sig = token.slice(splitAt + 1);
+  const expected = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
+  return sig.length === expected.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+}
+
+function securityHeaders(headers = {}) {
+  return {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "X-Frame-Options": "SAMEORIGIN",
+    ...headers
+  };
+}
+
+function send(res, status, body, headers = {}) {
+  res.writeHead(status, securityHeaders(headers));
+  res.end(body);
+}
+
+function json(res, status, data) {
+  send(res, status, JSON.stringify(data), { "Content-Type": "application/json; charset=utf-8" });
+}
+
+async function readBody(req) {
+  let body = "";
+  for await (const chunk of req) body += chunk;
+  if (!body) return {};
+  const type = req.headers["content-type"] || "";
+  if (type.includes("application/json")) return JSON.parse(body);
+  return Object.fromEntries(new URLSearchParams(body));
+}
+
+function escapeHtml(value = "") {
+  return String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
+}
+
+function layout(title, content, req) {
+  const admin = fixedIsAdmin(req);
+  const csrfToken = escapeHtml(req.csrfToken || "");
+  const nav = [
+    ["/", "Home"],
+    ["/products", "Products"],
+    ["/feedback", "Feedback"],
+    ["/contact", "Contact"],
+    [admin ? "/admin" : "/login", "Admin"]
+  ];
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeHtml(title)} | Shaw Enterprise</title>
+  <meta name="csrf-token" content="${csrfToken}" />
+  <link rel="stylesheet" href="/styles.css" />
+  <script defer src="/client.js"></script>
+</head>
+<body>
+  <div class="launch-screen" aria-hidden="true"><div class="launch-mark">SE</div><p>STOCK IN MOTION</p><i></i></div>
+  <div class="page-atmosphere" aria-hidden="true"></div>
+  <div class="cursor-aura" aria-hidden="true"></div>
+  <div class="scroll-signal" aria-hidden="true"><i></i></div>
+  <header class="site-header">
+    <a class="brand" href="/"><img src="/logo.svg" alt="Shaw Enterprise" /></a>
+    <button class="nav-toggle" type="button" aria-label="Open navigation">Menu</button>
+    <nav class="site-nav">${nav.map(([href, label]) => `<a href="${href}">${label}</a>`).join("")}</nav>
+  </header>
+  <main>${content}</main>
+  <footer class="site-footer">
+    <div><strong>Shaw Enterprise</strong><span>Wholesale and retail disposable products.</span></div>
+    <div>${escapeHtml(settings.phone)} | ${escapeHtml(settings.email)}</div>
+  </footer>
+</body>
+</html>`;
+}
+
+function HomePage(req) {
+  const products = getProducts().filter((item) => item.featured).slice(0, 3);
+  const metrics = getCatalogMetrics();
+  return layout("Home", `
+    <section class="hero">
+      <div class="hero-media"></div>
+      <div class="hero-vfx" aria-hidden="true">
+        <i class="vfx-orb orb-one"></i><i class="vfx-orb orb-two"></i><i class="vfx-orb orb-three"></i>
+        <span class="vfx-particle particle-one"></span><span class="vfx-particle particle-two"></span><span class="vfx-particle particle-three"></span><span class="vfx-particle particle-four"></span><span class="vfx-particle particle-five"></span>
+        <b class="vfx-sweep"></b><b class="vfx-grid"></b><b class="vfx-halo"></b>
+        <span class="hero-ring ring-a"></span><span class="hero-ring ring-b"></span><span class="hero-scanline"></span>
+        <div class="vfx-objects" aria-hidden="true">
+          <div class="vfx-cup"><i></i><b></b></div>
+          <div class="vfx-plate"><i></i></div>
+          <div class="vfx-cube"><i></i><b></b><em></em></div>
+        </div>
+        <div class="floating-stock stock-cups"><small>01</small><strong>CUPS</strong><em>360° supply</em></div>
+        <div class="floating-stock stock-plates"><small>02</small><strong>PLATES</strong><em>ready to ship</em></div>
+        <div class="floating-stock stock-packs"><small>03</small><strong>PACKS</strong><em>bulk volume</em></div>
+      </div>
+      <div class="hero-content">
+        <div class="hero-topline"><span>INDIA / WHOLESALE SUPPLY</span><span>EST. 2012</span></div>
+        <p class="eyebrow">Wholesale and retail disposable products</p>
+        <h1><span>Shaw</span> <span class="outline-word">Enterprise</span></h1>
+        <p>Reliable paper cups, plates, containers, cutlery, and packaging supplies for shops, caterers, offices, and events.</p>
+        <div class="hero-metrics">
+          <span><strong>${metrics.totalProducts}</strong> active SKUs</span>
+          <span><strong>${metrics.categories.length}</strong> product types</span>
+          <span><strong>${metrics.featured}</strong> fast-moving items</span>
+        </div>
+        <div class="hero-actions">
+          <a class="button primary" href="/products">View Products</a>
+          <a class="button ghost" href="https://wa.me/${escapeHtml(settings.whatsapp)}">WhatsApp Enquiry</a>
+        </div>
+        <div class="hero-scroll-cue"><i></i><span>SCROLL TO EXPLORE</span></div>
+      </div>
+    </section>
+    <section class="band">
+      <div class="section-head">
+        <p class="eyebrow">About the business</p>
+        <h2>Professional supply for everyday food service.</h2>
+      </div>
+      <div class="feature-grid">
+        <article><span class="feature-icon">01</span><h3>Wholesale Ready</h3><p>Bulk carton supply, category-wise stock planning, and consistent repeat order handling.</p></article>
+        <article><span class="feature-icon">02</span><h3>Retail Friendly</h3><p>Practical pack sizes for homes, small shops, food stalls, and event buyers.</p></article>
+        <article><span class="feature-icon">03</span><h3>Fast Enquiries</h3><p>Contact through the website, phone, or WhatsApp for pricing and availability.</p></article>
+      </div>
+    </section>
+    <section class="band tint">
+      <div class="section-head"><p class="eyebrow">Featured stock</p><h2>Popular disposable items</h2></div>
+      <div class="product-grid">${products.map(ProductCard).join("")}</div>
+    </section>
+    <aside class="product-panel" id="productPanel" aria-hidden="true"></aside>
+  `, req);
+}
+
+function ProductCard(product) {
+  return `
+    <article
+    class="product-card"
+    data-product-id="${product.id}"
+    data-name="${escapeHtml(`${product.name} ${product.category} ${product.summary}`.toLowerCase())}"
+    data-category="${escapeHtml(product.category.toLowerCase())}"
+    data-summary="${escapeHtml(product.summary.toLowerCase())}"
+    data-details="${escapeHtml(product.details.toLowerCase())}"
+    data-pack="${escapeHtml(product.packSize.toLowerCase())}"
+    data-audience="${escapeHtml(product.audience.toLowerCase())}"
+>
+      <img
+        src="${escapeHtml(product.images[0] || "/images/product.svg")}"
+        alt="${escapeHtml(product.name)}"
+      />
+
+      <div class="product-card-body">
+        <p class="tag">${escapeHtml(product.category)}</p>
+
+        <h3>${escapeHtml(product.name)}</h3>
+
+        <p>${escapeHtml(product.summary)}</p>
+
+        <div class="product-meta">
+          <strong>${escapeHtml(product.price)}</strong>
+          <span>${escapeHtml(product.packSize)}</span>
+        </div>
+
+        <button
+          class="button small view-product"
+          type="button"
+          data-product-id="${product.id}"
+        >
+          View Product
+        </button>
+      </div>
+    </article>
+  `;
+}
+
+function ProductsPage(req) {
+  const products = getProducts();
+  const categories = [...new Set(products.map((product) => product.category))];
+  return layout(
+    "Products",
+    `
+      <section class="page-title catalog-title">
+        <p class="eyebrow">Curated product catalog</p>
+        <h1>Everything your business needs, in one place.</h1>
+        <p>Browse dependable everyday disposables for shops, events, delivery, and food service.</p>
+      </section>
+
+      <section class="band">
+        <div class="catalog-toolbar">
+          <div class="catalog-toolbar-top">
+            <label class="catalog-search-field"><span>⌕</span><input id="productSearch" type="search" placeholder="Search products, categories or uses" /></label>
+            <label class="catalog-sort-field"><span>Sort</span><select id="productSort"><option value="featured">Featured first</option><option value="name-asc">Name: A–Z</option><option value="name-desc">Name: Z–A</option></select></label>
+          </div>
+          <div class="catalog-filter-row" aria-label="Filter products">
+            <button class="filter-chip active" type="button" data-category="all">All <span>${products.length}</span></button>
+            ${categories.map((category) => `<button class="filter-chip" type="button" data-category="${escapeHtml(category.toLowerCase())}">${escapeHtml(category)}</button>`).join("")}
+          </div>
+          <div class="catalog-status"><p id="catalogCount">Showing all ${products.length} products</p><p class="catalog-empty" hidden>No products found. Try a different search.</p></div>
+        </div>
+
+        <div class="product-grid" id="productGrid">
+          ${products.map(ProductCard).join("")}
+        </div>
+
+      </section>
+
+      <aside
+        class="product-panel"
+        id="productPanel"
+        aria-hidden="true"
+      ></aside>
+    `,
+    req
+  );
+}
+
+function FeedbackPage(req, visitor) {
+  const identity = getIdentity(visitor.id);
+  return layout("Feedback", `
+    <section class="page-title compact">
+      <p class="eyebrow">Community feedback</p>
+      <h1>Customer feedback and product reviews.</h1>
+    </section>
+    <section class="feedback-shell" data-identity='${escapeHtml(JSON.stringify(identity ? { email: safeEmail(identity.email), verified: Boolean(identity.verified) } : null))}'>
+      <form class="feedback-form" id="feedbackForm">
+        <div id="feedbackIdentity"></div>
+        <label>Feedback<textarea name="message" rows="4" placeholder="Share your experience with Shaw Enterprise" required></textarea></label>
+        <button class="button primary" type="submit">Post Feedback</button>
+        <p class="form-note" id="otpNote"></p>
+      </form>
+      <div class="feedback-toolbar">
+        <strong>Comments</strong>
+        <select id="feedbackSort"><option value="top">Top</option><option value="newest">Newest</option></select>
+      </div>
+      <div id="feedbackList" class="feedback-list"></div>
+      <button class="button ghost" id="loadMoreFeedback" type="button">Load More</button>
+    </section>
+  `, req);
+}
+
+function ContactPage(req) {
+  const sent = new URL(req.url, `http://${req.headers.host || "localhost"}`).searchParams.get("sent") === "1";
+  return layout("Contact", `
+    <section class="page-title compact"><p class="eyebrow">Contact</p><h1>Send an enquiry for pricing, stock, or bulk supply.</h1></section>
+    <section class="contact-layout">
+      <form class="contact-form" method="post" action="/contact">
+        <input type="hidden" name="_csrf" value="${escapeHtml(req.csrfToken || "")}" />
+        <label>Name<input name="name" required /></label>
+        <label>Email<input name="email" type="email" required /></label>
+        <label>Phone<input name="phone" required /></label>
+        <label>Message<textarea name="message" rows="5" required></textarea></label>
+        <button class="button primary" type="submit">Send Enquiry</button>
+        <p class="form-note contact-note">${sent ? "Enquiry saved. We will contact you shortly." : ""}</p>
+      </form>
+      <aside class="contact-card">
+        <h2>Business details</h2>
+        <p>${escapeHtml(settings.phone)}</p>
+        <p>${escapeHtml(settings.email)}</p>
+        <p>${escapeHtml(settings.address)}</p>
+        <a class="button ghost" href="https://wa.me/${escapeHtml(settings.whatsapp)}">Open WhatsApp</a>
+      </aside>
+    </section>
+  `, req);
+}
+
+function LoginPage(req, error = "") {
+  return layout("Admin Login", `
+    <section class="auth-wrap">
+      <div class="auth-orb auth-orb-one"></div><div class="auth-orb auth-orb-two"></div>
+      <div class="auth-shell">
+        <aside class="auth-intro"><img src="/logo.svg" alt="Shaw Enterprise" /><p class="eyebrow">Secure workspace</p><h1>Manage the business with confidence.</h1><p>Protected access, live verification, and an elegant control centre for your team.</p><div class="auth-trust"><span>✦ Encrypted sessions</span><span>✦ Two-channel verification</span><span>✦ Activity audit trail</span></div></aside>
+        <div class="auth-card">
+          <div class="auth-card-head"><p class="eyebrow">Administrator portal</p><h2 id="authTitle">Welcome back</h2><p id="authSubtitle">Sign in to continue to your dashboard.</p></div>
+          ${error ? `<p class="error">${escapeHtml(error)}</p>` : ""}
+          <p class="auth-status" id="authStatus" aria-live="polite"></p>
+          <form id="loginForm" class="auth-form" method="post" action="/login">
+            <input type="hidden" name="_csrf" value="${escapeHtml(req.csrfToken || "")}" />
+            <label>Username or email<input name="username" autocomplete="username" required /></label>
+            <label>Password<span class="password-field"><input name="password" type="password" autocomplete="current-password" required /><button class="password-toggle" type="button" aria-label="Show password">Show</button></span></label>
+            <div class="auth-row"><label class="remember"><input type="checkbox" name="remember" /> Keep me signed in</label><button class="link-button" type="button" data-auth-view="forgot">Forgot password?</button></div>
+            <button class="button primary auth-submit" type="submit">Sign in securely <span>→</span></button>
+            <div class="auth-divider"><span>or</span></div>
+            <a class="google-button ${googleEnabled() ? "" : "disabled"}" href="${googleEnabled() ? "/auth/google" : "#"}" ${googleEnabled() ? "" : "aria-disabled=\"true\" title=\"Google OAuth needs client credentials\""}><b>G</b> Continue with Google</a>
+          </form>
+          <form id="registerForm" class="auth-form hidden" novalidate>
+            <label>Full name / username<input name="username" minlength="3" autocomplete="username" required /></label><label>Work email<input name="email" type="email" autocomplete="email" required /></label><label>Mobile number<input name="phone" type="tel" placeholder="+91 98765 43210" autocomplete="tel" required /></label><label>Create password<span class="password-field"><input name="password" type="password" minlength="12" autocomplete="new-password" required /><button class="password-toggle" type="button">Show</button></span></label><button class="button primary auth-submit" type="submit">Create admin account <span>→</span></button>
+          </form>
+          <form id="verifyForm" class="auth-form hidden" novalidate><p class="verify-copy">We sent a six-digit code to your email and phone. Enter both to activate access.</p><label>Email code<input name="emailCode" inputmode="numeric" maxlength="6" placeholder="000000" required /></label><label>Phone code<input name="phoneCode" inputmode="numeric" maxlength="6" placeholder="000000" required /></label><button class="button primary auth-submit" type="submit">Verify & activate <span>✓</span></button><button class="link-button resend-code" type="button">Resend verification codes</button></form>
+          <form id="forgotForm" class="auth-form hidden" novalidate><label>Email address<input name="email" type="email" autocomplete="email" required /></label><button class="button primary auth-submit" type="submit">Send reset code <span>→</span></button></form>
+          <form id="resetForm" class="auth-form hidden" novalidate><label>Reset code<input name="code" inputmode="numeric" maxlength="6" placeholder="000000" required /></label><label>New password<span class="password-field"><input name="password" type="password" minlength="12" autocomplete="new-password" required /><button class="password-toggle" type="button">Show</button></span></label><button class="button primary auth-submit" type="submit">Set new password <span>✓</span></button></form>
+          <p class="auth-switch" id="authSwitch">New to the workspace? <button class="link-button" type="button" data-auth-view="register">Create an account</button></p>
+        </div>
+      </div>
+    </section>
+  `, req);
+}
+
+function mysqlSyncAdminAccount(row) {
+  if (!row) return false;
+  return mysqlRun(`
+    INSERT INTO admin_accounts (id, username, email, phone, password_hash, email_verified, phone_verified, created_at, updated_at)
+    VALUES (${row.id}, ${mysqlEscape(row.username)}, ${mysqlEscape(row.email)}, ${mysqlEscape(row.phone)}, ${mysqlEscape(row.password_hash)}, ${mysqlBool(row.email_verified)}, ${mysqlBool(row.phone_verified)}, ${mysqlEscape(mysqlDate(row.created_at))}, ${mysqlEscape(mysqlDate(row.updated_at))})
+    ON DUPLICATE KEY UPDATE username = VALUES(username), email = VALUES(email), phone = VALUES(phone), password_hash = VALUES(password_hash), email_verified = VALUES(email_verified), phone_verified = VALUES(phone_verified), updated_at = VALUES(updated_at);
+  `);
+}
+
+function mysqlSyncAdminAuthCode(row) {
+  if (!row) return;
+  mysqlRun(`
+    INSERT INTO admin_auth_codes (id, account_id, destination, channel, purpose, code_hash, expires_at, used_at, created_at)
+    VALUES (${row.id}, ${row.account_id || "NULL"}, ${mysqlEscape(row.destination)}, ${mysqlEscape(row.channel)}, ${mysqlEscape(row.purpose)}, ${mysqlEscape(row.code_hash)}, ${mysqlEscape(mysqlDate(row.expires_at))}, ${mysqlEscape(mysqlDate(row.used_at))}, ${mysqlEscape(mysqlDate(row.created_at))})
+    ON DUPLICATE KEY UPDATE used_at = VALUES(used_at), expires_at = VALUES(expires_at);
+  `);
+}
+
+function authenticateAdmin(data) {
+  const identifier = String(data.username || "").trim();
+  const password = String(data.password || "");
+  const account = db.prepare("SELECT * FROM admin_accounts WHERE username = ? OR email = ?").get(identifier, identifier.toLowerCase());
+  const envAdmin = identifier === ADMIN_USER && password === ADMIN_PASSWORD;
+  const accountAdmin = account && account.email_verified && account.phone_verified && passwordMatches(password, account.password_hash);
+  return { account, authenticated: Boolean(envAdmin || accountAdmin) };
+}
+
+function signedValue(value) {
+  return `${value}.${crypto.createHmac("sha256", SESSION_SECRET).update(value).digest("hex")}`;
+}
+
+function valueMatches(token, value) {
+  const expected = signedValue(value);
+  return token && token.length === expected.length && crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected));
+}
+
+function googleEnabled() {
+  return Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
+}
+
+function AdminTabs(activeTab) {
+  const tabs = [
+    ["/admin/products", "Products", "products"],
+    ["/admin/inquiries", "Inquiries", "inquiries"],
+    ["/admin/feedback", "Feedback", "feedback"],
+    ["/admin/audits", "Audits", "audits"]
+  ];
+  return `<nav class="admin-tabs">${tabs.map(([href, label, key]) => `<a class="${activeTab === key ? "active" : ""}" href="${href}">${label}</a>`).join("")}</nav>`;
+}
+
+function AdminPage(req, activeTab = "products") {
+  const metrics = getCatalogMetrics();
+  const health = healthPayload();
+  const showProducts = activeTab === "products";
+  const showInquiries = activeTab === "inquiries";
+  const showFeedback = activeTab === "feedback";
+  const showAudits = activeTab === "audits";
+  return layout("Admin", `
+    <section class="admin-shell">
+      <div class="admin-head">
+        <div><p class="eyebrow">Control room</p><h1>Admin Dashboard</h1></div>
+        <a class="button ghost" href="/logout">Logout</a>
+      </div>
+      <section class="admin-command-center">
+        <article><span>${metrics.totalProducts}</span><strong>Products</strong><small>${metrics.featured} featured SKUs</small></article>
+        <article><span>${metrics.inquiries.new}</span><strong>New Enquiries</strong><small>${metrics.inquiries.total} total enquiries</small></article>
+        <article><span>${metrics.feedback}</span><strong>Visible Feedback</strong><small>Reviews and public comments</small></article>
+        <article><span>${health.mysqlSync.enabled ? "On" : "Off"}</span><strong>MySQL Sync</strong><small>${health.mysqlSync.configured ? "Configured" : "Needs password/env"}</small></article>
+      </section>
+      ${AdminTabs(activeTab)}
+      ${showProducts ? `
+      <section class="admin-section">
+        <h2>Product Management</h2>
+        <form id="productForm" class="admin-form">
+          <input type="hidden" name="id" />
+          <label>Name<input name="name" required /></label>
+          <label>Category<input name="category" required /></label>
+          <label>Price<input name="price" required /></label>
+          <label>Type<input name="productType" required /></label>
+          <label>Pack Size<input name="packSize" required /></label>
+          <label>Audience<input name="audience" required /></label>
+          <label>Summary<textarea name="summary" rows="2" required></textarea></label>
+          <label>Details<textarea name="details" rows="4" required></textarea></label>
+          <label>Product Images<input name="imageFiles" type="file" accept="image/*" multiple /></label>
+          <input name="images" type="hidden" />
+          <div class="image-preview-grid" id="imagePreviewGrid"></div>
+          <label class="check"><input name="featured" type="checkbox" /> Featured product</label>
+          <div class="admin-actions"><button class="button primary" type="submit">Save Product</button><button class="button ghost" id="resetProductForm" type="button">Clear</button></div>
+        </form>
+        <div id="adminProducts" class="admin-list"></div>
+      </section>
+      ` : ""}
+      ${showFeedback ? `
+      <section class="admin-section">
+        <h2>Feedback Moderation</h2>
+        <div id="adminFeedback" class="admin-list"></div>
+      </section>
+      ` : ""}
+      ${showInquiries ? `
+      <section class="admin-section">
+        <h2>Inquiries</h2>
+        <div id="adminInquiries" class="admin-list"></div>
+      </section>
+      ` : ""}
+      ${showAudits ? `
+      <section class="admin-section">
+        <h2>Audit Log</h2>
+        <div id="auditLog" class="audit-list"></div>
+      </section>
+      ` : ""}
+    </section>
+  `, req);
+}
+
+function validateProduct(data) {
+  const required = ["name", "category", "price", "productType", "summary", "details", "packSize", "audience"];
+  for (const key of required) if (!String(data[key] || "").trim()) return `${key} is required`;
+  return null;
+}
+
+function productPayload(data) {
+  const images = Array.isArray(data.images)
+    ? data.images.map((item) => String(item).trim()).filter(Boolean)
+    : String(data.images || "").split(/\n|,/).map((item) => item.trim()).filter(Boolean);
+  return {
+    name: data.name.trim(),
+    category: data.category.trim(),
+    price: data.price.trim(),
+    productType: data.productType.trim(),
+    summary: data.summary.trim(),
+    details: data.details.trim(),
+    packSize: data.packSize.trim(),
+    audience: data.audience.trim(),
+    imagesJson: JSON.stringify(images),
+    featured: data.featured === true || data.featured === "on" || data.featured === "true" ? 1 : 0
+  };
+}
+
+function requireAdmin(req, res) {
+  if (!fixedIsAdmin(req)) {
+    json(res, 401, { error: "Admin login required" });
+    return false;
+  }
+  return true;
+}
+
+function hashOtp(otp) {
+  return crypto.createHash("sha256").update(`${otp}:${SESSION_SECRET}`).digest("hex");
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+
+function passwordMatches(password, saved) {
+  const [salt, expected] = String(saved || "").split(":");
+  if (!salt || !expected) return false;
+  const actual = crypto.scryptSync(String(password), salt, 64).toString("hex");
+  return actual.length === expected.length && crypto.timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
+}
+
+function validPhone(phone) {
+  return /^\+?[1-9]\d{7,14}$/.test(String(phone).replace(/[\s()-]/g, ""));
+}
+
+function normalizePhone(phone) {
+  return String(phone || "").replace(/[\s()-]/g, "");
+}
+
+function sendAuthCode(destination, channel, code) {
+  const provider = channel === "phone" ? SMS_PROVIDER : EMAIL_PROVIDER;
+  if (provider === "dev") {
+    if (IS_PRODUCTION) return { ok: false, error: "A verification provider must be configured" };
+    console.log(`Local ${channel} verification code for ${destination}: ${code}`);
+    return { ok: true, devCode: code };
+  }
+  if (channel === "phone" && provider === "console") {
+    console.log(`SMS verification code to ${destination}: ${code}`);
+    return { ok: true };
+  }
+  return deliverOtp(destination, code);
+}
+
+function issueAuthCode(account, destination, channel, purpose) {
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  const result = db.prepare(`INSERT INTO admin_auth_codes (account_id, destination, channel, purpose, code_hash, expires_at, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(account?.id || null, destination, channel, purpose, hashOtp(code), new Date(Date.now() + 10 * 60 * 1000).toISOString(), nowSql());
+  mysqlSyncAdminAuthCode(db.prepare("SELECT * FROM admin_auth_codes WHERE id = ?").get(result.lastInsertRowid));
+  return sendAuthCode(destination, channel, code);
+}
+
+function consumeAuthCode(accountId, destination, channel, purpose, code, markUsed = true) {
+  const row = db.prepare(`SELECT * FROM admin_auth_codes WHERE account_id = ? AND destination = ? AND channel = ? AND purpose = ? AND used_at IS NULL ORDER BY id DESC LIMIT 1`)
+    .get(accountId, destination, channel, purpose);
+  if (!row || row.expires_at < nowSql() || row.code_hash !== hashOtp(String(code || "").trim())) return false;
+  if (markUsed) {
+    db.prepare("UPDATE admin_auth_codes SET used_at = ? WHERE id = ?").run(nowSql(), row.id);
+    mysqlSyncAdminAuthCode(db.prepare("SELECT * FROM admin_auth_codes WHERE id = ?").get(row.id));
+  }
+  return true;
+}
+
+function healthPayload() {
+  const productCount = db.prepare("SELECT COUNT(*) AS count FROM products").get().count;
+  return {
+    ok: true,
+    service: "shaw-enterprise",
+    environment: NODE_ENV,
+    sqlite: { ok: true, path: DB_PATH, products: productCount },
+    mysqlSync: { enabled: MYSQL_SYNC_ENABLED, configured: Boolean(MYSQL_PASSWORD) },
+    email: { provider: EMAIL_PROVIDER, configured: EMAIL_PROVIDER !== "dev" || !IS_PRODUCTION },
+    checkedAt: nowSql()
+  };
+}
+
+function deliverOtp(email, otp) {
+  if (EMAIL_PROVIDER === "dev") {
+    if (IS_PRODUCTION) return { ok: false, error: "Email provider is not configured" };
+    console.log(`Local test OTP for ${email}: ${otp}`);
+    return { ok: true, devOtp: otp };
+  }
+  if (EMAIL_PROVIDER === "console") {
+    console.log(`OTP email from ${EMAIL_FROM} to ${email}: ${otp}`);
+    return { ok: true };
+  }
+  return { ok: false, error: `Unsupported EMAIL_PROVIDER: ${EMAIL_PROVIDER}` };
+}
+
+function imageSvg(label, color) {
+  return `<svg width="900" height="620" viewBox="0 0 900 620" fill="none" xmlns="http://www.w3.org/2000/svg"><rect width="900" height="620" fill="${color}"/><path d="M0 480C165 395 281 534 435 455C592 375 682 428 900 318V620H0V480Z" fill="rgba(15,47,46,.13)"/><rect x="70" y="70" width="760" height="480" rx="38" fill="rgba(255,255,255,.75)"/><circle cx="450" cy="260" r="128" fill="#0F2F2E" opacity=".12"/><text x="450" y="292" text-anchor="middle" fill="#0F2F2E" font-family="Georgia,serif" font-size="54" font-weight="700">${label}</text><text x="450" y="365" text-anchor="middle" fill="#304B49" font-family="Verdana,sans-serif" font-size="22">Shaw Enterprise</text></svg>`;
+}
+
+initDb();
+
+const server = http.createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    if (req.method === "GET" && url.pathname === "/healthz") return json(res, 200, healthPayload());
+
+    const visitor = getVisitor(req, res);
+    req.csrfToken = getCsrfToken(req, res);
+
+    if (url.pathname.startsWith("/images/")) {
+      const imageName = url.pathname.toLowerCase();
+      const label = imageName.includes("cup") ? "Paper Cups"
+        : imageName.includes("plate") ? "Paper Plates"
+        : imageName.includes("container") ? "Containers"
+        : imageName.includes("cutlery") ? "Cutlery"
+        : imageName.includes("napkin") ? "Napkins"
+        : imageName.includes("bag") ? "Paper Bags"
+        : imageName.includes("straw") ? "Straws"
+        : imageName.includes("bowl") ? "Bowls"
+        : "Products";
+      const colors = ["#F4E9D2", "#D5E4DE", "#E9DFC8", "#D7E5EC", "#EFE6EA"];
+      const color = colors[Array.from(imageName).reduce((sum, char) => sum + char.charCodeAt(0), 0) % colors.length];
+      return send(res, 200, imageSvg(escapeHtml(label), color), { "Content-Type": "image/svg+xml" });
+    }
+
+    if (req.method === "GET" && ["/styles.css", "/client.js", "/logo.svg"].includes(url.pathname)) {
+      const file = path.join(PUBLIC_DIR, url.pathname);
+      const type = url.pathname.endsWith(".css") ? "text/css" : url.pathname.endsWith(".js") ? "text/javascript" : "image/svg+xml";
+      return send(res, 200, fs.readFileSync(file), { "Content-Type": type });
+    }
+
+    if (req.method === "GET" && url.pathname === "/") return send(res, 200, HomePage(req), { "Content-Type": "text/html; charset=utf-8" });
+    if (req.method === "GET" && url.pathname === "/products") return send(res, 200, ProductsPage(req), { "Content-Type": "text/html; charset=utf-8" });
+    if (req.method === "GET" && url.pathname === "/feedback") return send(res, 200, FeedbackPage(req, visitor), { "Content-Type": "text/html; charset=utf-8" });
+    if (req.method === "GET" && url.pathname === "/contact") return send(res, 200, ContactPage(req), { "Content-Type": "text/html; charset=utf-8" });
+    if (req.method === "GET" && url.pathname === "/wholesale") return send(res, 302, "", { Location: "/products" });
+    if (req.method === "POST" && url.pathname === "/contact") {
+      if (!rateLimit(req, "contact", { limit: 8, windowMs: 10 * 60 * 1000 })) return send(res, 429, ContactPage(req), { "Content-Type": "text/html; charset=utf-8" });
+      const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return send(res, 403, ContactPage(req), { "Content-Type": "text/html; charset=utf-8" });
+      const result = saveInquiry(data);
+      if (result.error) return send(res, 400, ContactPage(req), { "Content-Type": "text/html; charset=utf-8" });
+      return send(res, 302, "", { Location: "/contact?sent=1" });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/auth/register") {
+      if (!rateLimit(req, "admin-register", { limit: 5, windowMs: 60 * 60 * 1000 })) return json(res, 429, { error: "Too many account requests. Try again later." });
+      const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+      const username = String(data.username || "").trim();
+      const email = String(data.email || "").trim().toLowerCase();
+      const phone = normalizePhone(data.phone);
+      const password = String(data.password || "");
+      if (!/^[a-zA-Z0-9._ -]{3,60}$/.test(username)) return json(res, 400, { error: "Use a 3–60 character username." });
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !validPhone(phone) || password.length < 12) return json(res, 400, { error: "Use a valid email, phone number, and a password of at least 12 characters." });
+      try {
+        const result = db.prepare("INSERT INTO admin_accounts (username, email, phone, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)").run(username, email, phone, hashPassword(password), nowSql(), nowSql());
+        const account = db.prepare("SELECT * FROM admin_accounts WHERE id = ?").get(result.lastInsertRowid);
+        if (MYSQL_SYNC_ENABLED && !mysqlSyncAdminAccount(account)) {
+          db.prepare("DELETE FROM admin_accounts WHERE id = ?").run(account.id);
+          return json(res, 503, { error: "Account database is temporarily unavailable. Please try again." });
+        }
+        const emailDelivery = issueAuthCode(account, email, "email", "signup");
+        const phoneDelivery = issueAuthCode(account, phone, "phone", "signup");
+        if (!emailDelivery.ok || !phoneDelivery.ok) return json(res, 503, { error: emailDelivery.error || phoneDelivery.error });
+        return json(res, 201, { message: "Verification codes sent", accountId: account.id, ...(emailDelivery.devCode ? { devEmailCode: emailDelivery.devCode } : {}), ...(phoneDelivery.devCode ? { devPhoneCode: phoneDelivery.devCode } : {}) });
+      } catch (error) {
+        return json(res, 409, { error: "That username, email, or phone number is already registered." });
+      }
+    }
+    if (req.method === "POST" && url.pathname === "/api/auth/verify-signup") {
+      const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+      const account = db.prepare("SELECT * FROM admin_accounts WHERE id = ?").get(Number(data.accountId));
+      const emailValid = account && consumeAuthCode(account.id, account.email, "email", "signup", data.emailCode, false);
+      const phoneValid = account && consumeAuthCode(account.id, account.phone, "phone", "signup", data.phoneCode, false);
+      if (!emailValid || !phoneValid) return json(res, 400, { error: "One or both verification codes are invalid or expired." });
+      consumeAuthCode(account.id, account.email, "email", "signup", data.emailCode);
+      consumeAuthCode(account.id, account.phone, "phone", "signup", data.phoneCode);
+      db.prepare("UPDATE admin_accounts SET email_verified = 1, phone_verified = 1, updated_at = ? WHERE id = ?").run(nowSql(), account.id);
+      mysqlSyncAdminAccount(db.prepare("SELECT * FROM admin_accounts WHERE id = ?").get(account.id));
+      return json(res, 200, { message: "Account verified. You can now sign in." });
+    }
+    if (req.method === "POST" && url.pathname === "/api/auth/resend-signup") {
+      const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+      const account = db.prepare("SELECT * FROM admin_accounts WHERE id = ?").get(Number(data.accountId));
+      if (!account) return json(res, 404, { error: "Account not found." });
+      const emailDelivery = issueAuthCode(account, account.email, "email", "signup"); const phoneDelivery = issueAuthCode(account, account.phone, "phone", "signup");
+      if (!emailDelivery.ok || !phoneDelivery.ok) return json(res, 503, { error: emailDelivery.error || phoneDelivery.error });
+      return json(res, 200, { message: "Fresh verification codes sent.", ...(emailDelivery.devCode ? { devEmailCode: emailDelivery.devCode } : {}), ...(phoneDelivery.devCode ? { devPhoneCode: phoneDelivery.devCode } : {}) });
+    }
+    if (req.method === "POST" && url.pathname === "/api/auth/request-reset") {
+      const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+      const account = db.prepare("SELECT * FROM admin_accounts WHERE email = ?").get(String(data.email || "").trim().toLowerCase());
+      if (!account) return json(res, 200, { message: "If an account exists, a reset code has been sent." });
+      const delivery = issueAuthCode(account, account.email, "email", "reset");
+      if (!delivery.ok) return json(res, 503, { error: delivery.error });
+      return json(res, 200, { message: "Reset code sent.", ...(delivery.devCode ? { devCode: delivery.devCode } : {}) });
+    }
+    if (req.method === "POST" && url.pathname === "/api/auth/reset-password") {
+      const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+      const account = db.prepare("SELECT * FROM admin_accounts WHERE email = ?").get(String(data.email || "").trim().toLowerCase());
+      if (!account || String(data.password || "").length < 12 || !consumeAuthCode(account.id, account.email, "email", "reset", data.code)) return json(res, 400, { error: "The reset code is invalid/expired, or the password is too short." });
+      db.prepare("UPDATE admin_accounts SET password_hash = ?, updated_at = ? WHERE id = ?").run(hashPassword(data.password), nowSql(), account.id);
+      mysqlSyncAdminAccount(db.prepare("SELECT * FROM admin_accounts WHERE id = ?").get(account.id));
+      return json(res, 200, { message: "Password updated. You can now sign in." });
+    }
+    if (req.method === "POST" && url.pathname === "/api/auth/login") {
+      if (!rateLimit(req, "login", { limit: 10, windowMs: 10 * 60 * 1000 })) return json(res, 429, { error: "Too many login attempts. Try again shortly." });
+      const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+      const { account, authenticated } = authenticateAdmin(data);
+      if (!authenticated) {
+        logAudit(req, "login_failed", "admin", data.username || "unknown", "Invalid admin login attempt");
+        return json(res, 401, { error: "Invalid username or password" });
+      }
+      setCookie(res, "shaw_admin", sessionToken(), { maxAge: 60 * 60 * 8, httpOnly: true, sameSite: "Lax" });
+      logAudit(req, "login", "admin", account?.username || ADMIN_USER, "Admin login successful");
+      return json(res, 200, { message: "Signed in successfully.", redirect: "/admin" });
+    }
+
+    if (req.method === "GET" && url.pathname === "/auth/google") {
+      if (!googleEnabled()) return send(res, 503, LoginPage(req, "Google sign-in is not configured yet."), { "Content-Type": "text/html; charset=utf-8" });
+      const state = `${Date.now()}:${randomId()}`;
+      setCookie(res, "shaw_google_state", signedValue(state), { maxAge: 10 * 60, httpOnly: true, sameSite: "Lax" });
+      const authorization = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+      authorization.search = new URLSearchParams({ client_id: GOOGLE_CLIENT_ID, redirect_uri: GOOGLE_REDIRECT_URI, response_type: "code", scope: "openid email profile", state, prompt: "select_account" }).toString();
+      return send(res, 302, "", { Location: authorization.toString() });
+    }
+    if (req.method === "GET" && url.pathname === "/auth/google/callback") {
+      const state = url.searchParams.get("state") || "";
+      const stateCookie = parseCookies(req).shaw_google_state;
+      setCookie(res, "shaw_google_state", "", { maxAge: 1, httpOnly: true, sameSite: "Lax" });
+      if (!googleEnabled() || !valueMatches(stateCookie, state) || url.searchParams.get("error")) return send(res, 400, LoginPage(req, "Google sign-in could not be verified. Please try again."), { "Content-Type": "text/html; charset=utf-8" });
+      try {
+        const tokenBody = new URLSearchParams({ code: url.searchParams.get("code") || "", client_id: GOOGLE_CLIENT_ID, client_secret: GOOGLE_CLIENT_SECRET, redirect_uri: GOOGLE_REDIRECT_URI, grant_type: "authorization_code" });
+        const tokenResponse = await fetch("https://oauth2.googleapis.com/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: tokenBody });
+        const tokens = await tokenResponse.json();
+        if (!tokenResponse.ok || !tokens.access_token) throw new Error("Google token exchange failed");
+        const profileResponse = await fetch("https://openidconnect.googleapis.com/v1/userinfo", { headers: { Authorization: `Bearer ${tokens.access_token}` } });
+        const profile = await profileResponse.json();
+        const email = String(profile.email || "").toLowerCase();
+        const account = profile.email_verified && db.prepare("SELECT * FROM admin_accounts WHERE email = ? AND email_verified = 1 AND phone_verified = 1").get(email);
+        if (!account) return send(res, 403, LoginPage(req, "This Google email is not a verified admin account. Create and verify the account first."), { "Content-Type": "text/html; charset=utf-8" });
+        setCookie(res, "shaw_admin", sessionToken(), { maxAge: 60 * 60 * 8, httpOnly: true, sameSite: "Lax" });
+        logAudit(req, "google_login", "admin", account.username, "Google OAuth login successful");
+        return send(res, 302, "", { Location: "/admin" });
+      } catch {
+        return send(res, 502, LoginPage(req, "Google authentication service is unavailable. Please use your password or try again."), { "Content-Type": "text/html; charset=utf-8" });
+      }
+    }
+    if (req.method === "GET" && url.pathname === "/login") return send(res, 200, LoginPage(req), { "Content-Type": "text/html; charset=utf-8" });
+    if (req.method === "POST" && url.pathname === "/login") {
+      if (!rateLimit(req, "login", { limit: 10, windowMs: 10 * 60 * 1000 })) return send(res, 429, LoginPage(req, "Too many login attempts. Try again shortly."), { "Content-Type": "text/html; charset=utf-8" });
+      const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return send(res, 403, LoginPage(req, "Security token expired. Reload and try again."), { "Content-Type": "text/html; charset=utf-8" });
+      const { account, authenticated } = authenticateAdmin(data);
+      if (authenticated) {
+        setCookie(res, "shaw_admin", sessionToken(), { maxAge: 60 * 60 * 8, httpOnly: true, sameSite: "Lax" });
+        logAudit(req, "login", "admin", account?.username || ADMIN_USER, "Admin login successful");
+        return send(res, 302, "", { Location: "/admin" });
+      }
+      logAudit(req, "login_failed", "admin", data.username || "unknown", "Invalid admin login attempt");
+      return send(res, 401, LoginPage(req, "Invalid username or password"), { "Content-Type": "text/html; charset=utf-8" });
+    }
+    if (req.method === "GET" && url.pathname === "/logout") {
+      if (fixedIsAdmin(req)) logAudit(req, "logout", "admin", ADMIN_USER, "Admin logout");
+      setCookie(res, "shaw_admin", "", { maxAge: 1, httpOnly: true, sameSite: "Lax" });
+      return send(res, 302, "", { Location: "/login" });
+    }
+    if (req.method === "GET" && url.pathname === "/admin") {
+      if (!fixedIsAdmin(req)) return send(res, 302, "", { Location: "/login" });
+      return send(res, 200, AdminPage(req, "products"), { "Content-Type": "text/html; charset=utf-8" });
+    }
+    const adminPageMatch = url.pathname.match(/^\/admin\/(products|inquiries|feedback|audits)$/);
+    if (req.method === "GET" && adminPageMatch) {
+      if (!fixedIsAdmin(req)) return send(res, 302, "", { Location: "/login" });
+      return send(res, 200, AdminPage(req, adminPageMatch[1]), { "Content-Type": "text/html; charset=utf-8" });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/products") return json(res, 200, { products: getProducts() });
+    if (req.method === "POST" && url.pathname === "/api/inquiries") {
+      if (!rateLimit(req, "api-inquiries", { limit: 8, windowMs: 10 * 60 * 1000 })) return json(res, 429, { error: "Too many enquiries. Try again shortly." });
+      const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+      const result = saveInquiry(data);
+      if (result.error) return json(res, 400, { error: result.error });
+      return json(res, 201, { inquiry: result.inquiry, message: "Enquiry saved" });
+    }
+    const productMatch = url.pathname.match(/^\/api\/products\/(\d+)$/);
+    if (req.method === "GET" && productMatch) {
+      const product = getProduct(Number(productMatch[1]));
+      if (!product) return json(res, 404, { error: "Product not found" });
+      return json(res, 200, { product, reviews: getFeedbackThreads(visitor.id, { productId: product.id, sort: "top" }) });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/feedback/request-otp") {
+      if (!rateLimit(req, "otp", { limit: 5, windowMs: 10 * 60 * 1000 })) return json(res, 429, { error: "Too many OTP requests. Try again shortly." });
+      const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+      const email = String(data.email || "").trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json(res, 400, { error: "Valid email is required" });
+      const otp = String(Math.floor(100000 + Math.random() * 900000));
+      const result = db.prepare("INSERT INTO feedback_identity_otps (visitor_id, email, otp_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)")
+        .run(visitor.id, email, hashOtp(otp), new Date(Date.now() + 10 * 60 * 1000).toISOString(), nowSql());
+      mysqlSyncOtp(db.prepare("SELECT * FROM feedback_identity_otps WHERE id = ?").get(result.lastInsertRowid));
+      const delivery = deliverOtp(email, otp);
+      if (!delivery.ok) return json(res, 503, { error: delivery.error });
+      return json(res, 200, { message: "OTP sent", ...(delivery.devOtp ? { devOtp: delivery.devOtp } : {}) });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/feedback/verify-otp") {
+      const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+      const email = String(data.email || "").trim().toLowerCase();
+      const otp = String(data.otp || "").trim();
+      const row = db.prepare(`
+        SELECT * FROM feedback_identity_otps
+        WHERE visitor_id = ? AND email = ? AND used_at IS NULL
+        ORDER BY id DESC LIMIT 1
+      `).get(visitor.id, email);
+      if (!row || row.expires_at < nowSql() || row.otp_hash !== hashOtp(otp)) return json(res, 400, { error: "Invalid or expired OTP" });
+      db.prepare("UPDATE feedback_identity_otps SET used_at = ? WHERE id = ?").run(nowSql(), row.id);
+      mysqlSyncOtp(db.prepare("SELECT * FROM feedback_identity_otps WHERE id = ?").get(row.id));
+      db.prepare(`
+        INSERT INTO feedback_identities (visitor_id, email, verified, created_at, updated_at)
+        VALUES (?, ?, 1, ?, ?)
+        ON CONFLICT(visitor_id) DO UPDATE SET email = excluded.email, verified = 1, updated_at = excluded.updated_at
+      `).run(visitor.id, email, nowSql(), nowSql());
+      mysqlSyncIdentity(db.prepare("SELECT * FROM feedback_identities WHERE visitor_id = ?").get(visitor.id));
+      return json(res, 200, { identity: { email: safeEmail(email), verified: true } });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/feedback") {
+      const sort = url.searchParams.get("sort") || "top";
+      const identity = getIdentity(visitor.id);
+      return json(res, 200, {
+        identity: identity ? { email: safeEmail(identity.email), verified: Boolean(identity.verified) } : null,
+        threads: getFeedbackThreads(visitor.id, { sort, productId: null })
+      });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/feedback") {
+      if (!rateLimit(req, "feedback", { limit: 20, windowMs: 10 * 60 * 1000 })) return json(res, 429, { error: "Too many feedback posts. Try again shortly." });
+      const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+      const identity = getIdentity(visitor.id);
+      if (!identity?.verified) return json(res, 403, { error: "Please verify your email before posting" });
+      const message = String(data.message || "").trim();
+      const parentId = data.parentId ? Number(data.parentId) : null;
+      const productId = data.productId ? Number(data.productId) : null;
+      if (message.length < 3) return json(res, 400, { error: "Feedback is too short" });
+      const result = db.prepare(`
+        INSERT INTO feedback_comments (visitor_id, author_email, message, parent_id, product_id, status, created_at)
+        VALUES (?, ?, ?, ?, ?, 'visible', ?)
+      `).run(visitor.id, identity.email, message, parentId, productId, nowSql());
+      mysqlSyncFeedback(db.prepare("SELECT * FROM feedback_comments WHERE id = ?").get(result.lastInsertRowid));
+      return json(res, 201, { ok: true });
+    }
+
+    const reactionMatch = url.pathname.match(/^\/api\/feedback\/(\d+)\/react$/);
+    if (req.method === "POST" && reactionMatch) {
+      const data = await readBody(req);
+      if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+      const id = Number(reactionMatch[1]);
+      const reaction = data.reaction === "heart" ? "heart" : "like";
+      const existing = db.prepare("SELECT * FROM feedback_reactions WHERE feedback_id = ? AND visitor_id = ?").get(id, visitor.id);
+      if (existing?.reaction === reaction) {
+        db.prepare("DELETE FROM feedback_reactions WHERE id = ?").run(existing.id);
+        mysqlDeleteReaction(existing.id);
+        return json(res, 200, { message: "Reaction removed" });
+      }
+      if (existing) {
+        db.prepare("UPDATE feedback_reactions SET reaction = ?, created_at = ? WHERE id = ?").run(reaction, nowSql(), existing.id);
+        mysqlSyncReaction(db.prepare("SELECT * FROM feedback_reactions WHERE id = ?").get(existing.id));
+      } else {
+        const result = db.prepare("INSERT INTO feedback_reactions (feedback_id, visitor_id, reaction, created_at) VALUES (?, ?, ?, ?)").run(id, visitor.id, reaction, nowSql());
+        mysqlSyncReaction(db.prepare("SELECT * FROM feedback_reactions WHERE id = ?").get(result.lastInsertRowid));
+      }
+      return json(res, 200, { message: "Reaction saved" });
+    }
+
+    if (url.pathname.startsWith("/api/admin/")) {
+      if (!requireAdmin(req, res)) return;
+      if (!["GET", "HEAD", "OPTIONS"].includes(req.method) && !rateLimit(req, "admin-write", { limit: 60, windowMs: 10 * 60 * 1000 })) {
+        return json(res, 429, { error: "Too many admin changes. Try again shortly." });
+      }
+      if (req.method === "GET" && url.pathname === "/api/admin/products") return json(res, 200, { products: getProducts() });
+      if (req.method === "POST" && url.pathname === "/api/admin/products") {
+        const data = await readBody(req);
+        if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+        const error = validateProduct(data);
+        if (error) return json(res, 400, { error });
+        const p = productPayload(data);
+        const result = db.prepare(`
+          INSERT INTO products (name, category, price, product_type, summary, details, pack_size, audience, images_json, featured, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(p.name, p.category, p.price, p.productType, p.summary, p.details, p.packSize, p.audience, p.imagesJson, p.featured, nowSql(), nowSql());
+        mysqlSyncProduct(db.prepare("SELECT * FROM products WHERE id = ?").get(result.lastInsertRowid));
+        logAudit(req, "create", "product", result.lastInsertRowid, p.name);
+        return json(res, 201, { products: getProducts(), auditLogs: getAuditLogs() });
+      }
+      const adminProductMatch = url.pathname.match(/^\/api\/admin\/products\/(\d+)$/);
+      if (adminProductMatch && req.method === "PUT") {
+        const data = await readBody(req);
+        if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+        const error = validateProduct(data);
+        if (error) return json(res, 400, { error });
+        const id = Number(adminProductMatch[1]);
+        const p = productPayload(data);
+        db.prepare(`
+          UPDATE products SET name=?, category=?, price=?, product_type=?, summary=?, details=?, pack_size=?, audience=?, images_json=?, featured=?, updated_at=?
+          WHERE id=?
+        `).run(p.name, p.category, p.price, p.productType, p.summary, p.details, p.packSize, p.audience, p.imagesJson, p.featured, nowSql(), id);
+        mysqlSyncProduct(db.prepare("SELECT * FROM products WHERE id = ?").get(id));
+        logAudit(req, "update", "product", id, p.name);
+        return json(res, 200, { products: getProducts(), auditLogs: getAuditLogs() });
+      }
+      if (adminProductMatch && req.method === "DELETE") {
+        if (!validateCsrf(req, req.csrfToken)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+        const id = Number(adminProductMatch[1]);
+        db.prepare("DELETE FROM products WHERE id = ?").run(id);
+        mysqlDeleteProduct(id);
+        logAudit(req, "delete", "product", id, "Product deleted");
+        return json(res, 200, { products: getProducts(), auditLogs: getAuditLogs() });
+      }
+      if (req.method === "GET" && url.pathname === "/api/admin/inquiries") return json(res, 200, { inquiries: getAdminInquiries(), auditLogs: getAuditLogs() });
+      if (req.method === "GET" && url.pathname === "/api/admin/audits") return json(res, 200, { auditLogs: getAuditLogs() });
+      const inquiryStatusMatch = url.pathname.match(/^\/api\/admin\/inquiries\/(\d+)\/status$/);
+      if (inquiryStatusMatch && req.method === "POST") {
+        const data = await readBody(req);
+        if (!validateCsrf(req, req.csrfToken, data)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+        const result = updateInquiryStatus(req, Number(inquiryStatusMatch[1]), String(data.status || ""));
+        if (result.error) return json(res, result.statusCode || 400, { error: result.error });
+        return json(res, 200, { inquiries: getAdminInquiries(), auditLogs: getAuditLogs() });
+      }
+      if (req.method === "GET" && url.pathname === "/api/admin/feedback") return json(res, 200, { feedback: getAdminFeedback(), auditLogs: getAuditLogs() });
+      const hideMatch = url.pathname.match(/^\/api\/admin\/feedback\/(\d+)\/hide$/);
+      if (hideMatch && req.method === "POST") {
+        if (!validateCsrf(req, req.csrfToken)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+        const id = Number(hideMatch[1]);
+        const row = db.prepare("SELECT status FROM feedback_comments WHERE id = ?").get(id);
+        const status = row?.status === "hidden" ? "visible" : "hidden";
+        db.prepare("UPDATE feedback_comments SET status = ? WHERE id = ?").run(status, id);
+        mysqlSyncFeedback(db.prepare("SELECT * FROM feedback_comments WHERE id = ?").get(id));
+        logAudit(req, status === "hidden" ? "hide" : "restore", "feedback", id, `Feedback ${status}`);
+        return json(res, 200, { feedback: getAdminFeedback(), auditLogs: getAuditLogs() });
+      }
+      const deleteFeedbackMatch = url.pathname.match(/^\/api\/admin\/feedback\/(\d+)$/);
+      if (deleteFeedbackMatch && req.method === "DELETE") {
+        if (!validateCsrf(req, req.csrfToken)) return json(res, 403, { error: "Security token expired. Reload and try again." });
+        const id = Number(deleteFeedbackMatch[1]);
+        db.prepare("DELETE FROM feedback_comments WHERE id = ?").run(id);
+        mysqlDeleteFeedback(id);
+        logAudit(req, "delete", "feedback", id, "Feedback deleted");
+        return json(res, 200, { feedback: getAdminFeedback(), auditLogs: getAuditLogs() });
+      }
+    }
+
+    return send(res, 404, layout("Not Found", `<section class="page-title compact"><h1>Page not found</h1><a class="button primary" href="/">Go Home</a></section>`, req), { "Content-Type": "text/html; charset=utf-8" });
+  } catch (error) {
+    console.error(error);
+    return json(res, 500, { error: "Server error" });
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`Shaw Enterprise running at http://localhost:${PORT}`);
+});
