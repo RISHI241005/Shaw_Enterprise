@@ -1,0 +1,21 @@
+<!doctype html><html lang="en" xmlns:th="http://www.thymeleaf.org" th:replace="~{layout :: layout('Home', ~{::main})}">
+<main>
+  <section class="hero">
+    <div class="hero-media"></div>
+    <div class="hero-vfx" aria-hidden="true"><i class="vfx-orb orb-one"></i><i class="vfx-orb orb-two"></i><i class="vfx-orb orb-three"></i><span class="vfx-particle particle-one"></span><span class="vfx-particle particle-two"></span><span class="vfx-particle particle-three"></span><span class="vfx-particle particle-four"></span><span class="vfx-particle particle-five"></span><b class="vfx-sweep"></b><b class="vfx-grid"></b><b class="vfx-halo"></b><span class="hero-ring ring-a"></span><span class="hero-ring ring-b"></span><span class="hero-scanline"></span><div class="vfx-objects"><div class="vfx-cup"><i></i><b></b></div><div class="vfx-plate"><i></i></div><div class="vfx-cube"><i></i><b></b><em></em></div></div><div class="floating-stock stock-cups"><small>01</small><strong>CUPS</strong><em>360° supply</em></div><div class="floating-stock stock-plates"><small>02</small><strong>PLATES</strong><em>ready to ship</em></div><div class="floating-stock stock-packs"><small>03</small><strong>PACKS</strong><em>bulk volume</em></div></div>
+    <div class="hero-content">
+      <div class="hero-topline"><span>INDIA / WHOLESALE SUPPLY</span><span>EST. 2012</span></div><p class="eyebrow">Wholesale and retail disposable products</p>
+      <h1><span>Shaw</span> <span class="outline-word">Enterprise</span></h1><p>Reliable paper cups, plates, containers, cutlery, and packaging supplies for shops, caterers, offices, and events.</p>
+      <div class="hero-metrics"><span><strong th:text="${metrics.totalProducts}">0</strong> active SKUs</span><span><strong th:text="${#lists.size(metrics.categories)}">0</strong> product types</span><span><strong th:text="${metrics.featured}">0</strong> fast-moving items</span></div>
+      <div class="hero-actions"><a class="button primary" href="/products">View Products</a><a class="button ghost" th:href="${'https://wa.me/' + business.whatsapp}" target="_blank" rel="noopener">WhatsApp Enquiry</a></div>
+      <div class="hero-scroll-cue"><i></i><span>SCROLL TO EXPLORE</span></div>
+    </div>
+  </section>
+  <section class="band"><div class="section-head"><p class="eyebrow">About the business</p><h2>Professional supply for everyday food service.</h2></div><div class="feature-grid"><article><span class="feature-icon">01</span><h3>Wholesale Ready</h3><p>Bulk carton supply, category-wise stock planning, and consistent repeat order handling.</p></article><article><span class="feature-icon">02</span><h3>Retail Friendly</h3><p>Practical pack sizes for homes, small shops, food stalls, and event buyers.</p></article><article><span class="feature-icon">03</span><h3>Fast Enquiries</h3><p>Contact through the website, phone, or WhatsApp for pricing and availability.</p></article></div></section>
+  <section class="band tint"><div class="section-head"><p class="eyebrow">Featured stock</p><h2>Popular disposable items</h2></div><div class="product-grid">
+    <article class="product-card" th:each="product : ${products}" th:data-product-id="${product.id}" th:data-name="${#strings.toLowerCase(product.name + ' ' + product.category + ' ' + product.summary)}" th:data-category="${#strings.toLowerCase(product.category)}" th:data-summary="${#strings.toLowerCase(product.summary)}" th:data-details="${#strings.toLowerCase(product.details)}" th:data-pack="${#strings.toLowerCase(product.packSize)}" th:data-audience="${#strings.toLowerCase(product.audience)}">
+      <img th:src="${#lists.isEmpty(product.images) ? '/images/product.svg' : product.images[0]}" th:alt="${product.name}" /><div class="product-card-body"><p class="tag" th:text="${product.category}"></p><h3 th:text="${product.name}"></h3><p th:text="${product.summary}"></p><div class="product-meta"><strong th:text="${product.price}"></strong><span th:text="${product.packSize}"></span></div><button class="button small view-product" type="button" th:data-product-id="${product.id}">View Product</button></div>
+    </article>
+  </div></section>
+  <aside class="product-panel" id="productPanel" aria-hidden="true"></aside>
+</main></html>

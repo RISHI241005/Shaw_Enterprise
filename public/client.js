@@ -134,7 +134,7 @@ async function requestOtp(root) {
     body: JSON.stringify({ email })
   });
   const note = qs(".form-note", root) || qs("#otpNote");
-  if (note) note.textContent = `Local test OTP: ${result.devOtp}`;
+  if (note) note.textContent = result.devOtp ? `Local test OTP: ${result.devOtp}` : result.message;
 }
 
 async function verifyOtp(root) {
@@ -666,6 +666,7 @@ document.addEventListener("click", async (event) => {
       fillProductForm(state.adminProducts.find((product) => String(product.id) === target.dataset.productId));
     }
     if (target.matches(".delete-product")) {
+      if (!window.confirm("Delete this product permanently?")) return;
       await fetchJson(`/api/admin/products/${target.dataset.productId}`, { method: "DELETE" });
       await refreshAdmin();
     }
@@ -675,6 +676,7 @@ document.addEventListener("click", async (event) => {
       renderAuditLog(result.auditLogs);
     }
     if (target.matches(".delete-feedback")) {
+      if (!window.confirm("Delete this feedback and its replies permanently?")) return;
       const result = await fetchJson(`/api/admin/feedback/${target.dataset.feedbackId}`, { method: "DELETE" });
       renderAdminFeedback(result.feedback);
       renderAuditLog(result.auditLogs);
@@ -714,6 +716,14 @@ document.addEventListener("submit", async (event) => {
       form.reset();
       form.elements.id.value = "";
       setProductFormImages([]);
+    }
+    if (form.matches("#businessSettingsForm")) {
+      event.preventDefault();
+      const settings = Object.fromEntries(new FormData(form));
+      const result = await fetchJson("/api/admin/settings", { method: "PUT", body: JSON.stringify(settings) });
+      const status = qs("#settingsStatus");
+      if (status) status.textContent = "Saved. The map and business details are now synced across all open pages.";
+      if (result.settings?.mapSearchUrl) form.querySelector("a[target='_blank']")?.setAttribute("href", result.settings.mapSearchUrl);
     }
   } catch (error) {
     alert(error.message);
@@ -770,7 +780,9 @@ function showAuthView(view) {
   const [title, subtitle, prefix, action] = authViews[view];
   qs("#authTitle").textContent = title; qs("#authSubtitle").textContent = subtitle;
   const switcher = qs("#authSwitch");
-  switcher.innerHTML = prefix ? `${prefix} <button class="link-button" type="button" data-auth-view="${view === "register" ? "login" : "register"}">${action}</button>` : "";
+  const canRegister = Boolean(qs("#registerForm"));
+  if (switcher && view === "login" && !canRegister) switcher.textContent = "Administrator access is owner-managed.";
+  else if (switcher) switcher.innerHTML = prefix ? `${prefix} <button class="link-button" type="button" data-auth-view="${view === "login" ? "register" : "login"}">${action}</button>` : "";
   qs("#authStatus").textContent = "";
 }
 
@@ -869,3 +881,23 @@ qsa(".feature-grid article, .feedback-item, .admin-section, .contact-card, .cont
 });
 
 applyProductFilters();
+
+// One lightweight stream keeps every open storefront/admin tab consistent with MySQL writes.
+if ("EventSource" in window) {
+  const live = new EventSource("/api/live");
+  let liveTimer = 0;
+  live.addEventListener("sync", (event) => {
+    window.clearTimeout(liveTimer);
+    liveTimer = window.setTimeout(async () => {
+      const topic = event.data;
+      if (document.querySelector(".admin-shell")) {
+        await refreshAdmin().catch(() => {});
+        if (topic === "settings" && document.querySelector("#businessSettingsForm")) window.location.reload();
+        return;
+      }
+      if (topic === "feedback" && document.querySelector("#feedbackList")) await refreshFeedback().catch(() => {});
+      else if (topic === "feedback" && state.productPanelProduct) await openProduct(state.productPanelProduct.id).catch(() => {});
+      else if ((topic === "products" && (location.pathname === "/" || location.pathname === "/products")) || (topic === "settings" && location.pathname === "/contact")) window.location.reload();
+    }, 250);
+  });
+}

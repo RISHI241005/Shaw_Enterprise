@@ -7,19 +7,31 @@ services:
     envVars:
       - key: PORT
         value: 3000
-      - key: NODE_ENV
-        value: production
-      - key: MYSQL_SYNC_ENABLED
-        value: false
+      - key: APP_PRODUCTION
+        value: true
       - key: ADMIN_USER
         sync: false
       - key: ADMIN_PASSWORD
         sync: false
-      - key: SESSION_SECRET
+      - key: OTP_SECRET
         sync: false
+      - key: DEV_EXPOSE_OTP
+        value: false
       - key: EMAIL_PROVIDER
+        value: resend
+      - key: EMAIL_FROM
         sync: false
-      - key: SMS_PROVIDER
+      - key: RESEND_API_KEY
+        sync: false
+      - key: MYSQL_HOST
+        sync: false
+      - key: MYSQL_PORT
+        value: 3306
+      - key: MYSQL_DATABASE
+        value: shaw_enterprise
+      - key: MYSQL_USER
+        sync: false
+      - key: MYSQL_PASSWORD
         sync: false
       - key: GOOGLE_CLIENT_ID
         sync: false

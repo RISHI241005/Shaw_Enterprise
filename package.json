@@ -1,21 +1,20 @@
 {
   "name": "shaw-enterprise",
-  "version": "1.0.0",
-  "description": "Professional full-stack website for Shaw Enterprise.",
-  "main": "server.js",
+  "version": "2.0.0",
+  "description": "Spring Boot and MySQL website for Shaw Enterprise.",
   "scripts": {
-    "start": "node --experimental-sqlite server.js",
-    "dev": "node --experimental-sqlite server.js",
-    "test": "node --test tests/*.test.js",
-    "db:backup": "node --experimental-sqlite scripts/backup-sqlite.js",
-    "db:export:mysql": "node --experimental-sqlite scripts/export-mysql-database.js",
-    "db:sync:mysql": "node --experimental-sqlite scripts/sync-mysql-from-sqlite.js"
+    "start": "mvn spring-boot:run",
+    "dev": "mvn spring-boot:run",
+    "build": "mvn clean package",
+    "test": "mvn test"
   },
   "keywords": [
     "shaw-enterprise",
     "wholesale",
     "retail",
-    "disposable-products"
+    "disposable-products",
+    "spring-boot",
+    "mysql"
   ],
   "author": "Shaw Enterprise",
   "license": "UNLICENSED"

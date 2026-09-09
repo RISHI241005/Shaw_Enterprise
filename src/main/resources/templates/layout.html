@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org" th:fragment="layout(title, content)">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="Shaw Enterprise wholesale and retail disposable products, bulk supply and business enquiries." />
+  <meta name="csrf-token" th:content="${csrf}" />
+  <title th:text="${title + ' | Shaw Enterprise'}">Shaw Enterprise</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <script defer src="/client.js"></script>
+</head>
+<body>
+  <div class="launch-screen" aria-hidden="true"><div class="launch-mark">SE</div><p>STOCK IN MOTION</p><i></i></div>
+  <div class="page-atmosphere" aria-hidden="true"></div><div class="cursor-aura" aria-hidden="true"></div><div class="scroll-signal" aria-hidden="true"><i></i></div>
+  <header class="site-header">
+    <a class="brand" href="/"><img src="/logo.svg" alt="Shaw Enterprise" /></a>
+    <button class="nav-toggle" type="button" aria-label="Open navigation">Menu</button>
+    <nav class="site-nav" aria-label="Main navigation">
+      <a href="/">Home</a><a href="/products">Products</a><a href="/feedback">Feedback</a><a href="/contact">Contact</a><a th:href="${isAdmin ? '/admin' : '/login'}">Admin</a>
+    </nav>
+  </header>
+  <main th:replace="${content}"></main>
+  <footer class="site-footer">
+    <div><strong th:text="${business.business_name}">Shaw Enterprise</strong><span>Wholesale and retail disposable products.</span></div>
+    <div><span th:text="${business.phone}"></span> | <span th:text="${business.email}"></span></div>
+  </footer>
+</body>
+</html>

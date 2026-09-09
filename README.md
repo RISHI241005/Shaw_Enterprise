@@ -1,151 +1,102 @@
-gra# Shaw Enterprise Website
+# Shaw Enterprise
 
-A professional full-stack website for Shaw Enterprise, a wholesale and retail disposable items business.
+Production-oriented website for a wholesale and retail disposable-products business. The active backend is Java 21 with Spring Boot 4.1.1. MySQL is the only runtime source of truth; the former Node/SQLite prototype remains in the repository only as migration history.
 
-## Run Locally
+## What works
 
-```bash
-npm run dev
+- Responsive Home, Products, Feedback, Contact, Login, and Admin pages
+- 300-product MySQL catalog with search, category filters, sorting, details, product images, and reviews
+- Transactional product create/update/delete APIs
+- Contact enquiries stored directly in MySQL and managed through status workflows
+- Email-verified feedback, replies, likes/hearts, product reviews, and admin moderation
+- BCrypt for all newly created/reset administrator passwords
+- Session rotation, CSRF checks, rate limits, validation, safe output escaping, security headers, and audit logs
+- Server-sent events that synchronize product, feedback, enquiry, and business-setting changes across open browser tabs
+- Embedded Google Map, Google Maps mobile directions URL, click-to-call, email, and WhatsApp links
+- Flyway schema migrations, Actuator health, Docker packaging, and Render configuration
+
+## Run locally
+
+Requirements: Java 21, Maven 3.9+, MySQL 8.
+
+The ignored `.env` file is already configured for this computer. It keeps database/admin secrets out of committed source.
+
+```powershell
+mvn spring-boot:run
 ```
 
-Open:
+Open [http://localhost:3000](http://localhost:3000). The admin portal is at [http://localhost:3000/login](http://localhost:3000/login).
 
-```text
-http://localhost:3000
+To build and test:
+
+```powershell
+mvn test
+mvn clean package
+java -jar target/shaw-enterprise-2.0.0.jar
 ```
 
-Admin login:
-
-```text
-http://localhost:3000/login
-```
-
-Default local credentials:
-
-```text
-Username: admin
-Password: change-me-now
-```
-
-Change these before real use by setting environment variables from `.env.example`.
-
-Useful local checks:
-
-```bash
-curl http://localhost:3000/healthz
-npm test
-```
-
-## Environment
-
-Copy `.env.example` to `.env` for local use. Production startup now requires:
-
-- `NODE_ENV=production`
-- `ADMIN_USER`
-- `ADMIN_PASSWORD` changed from the default and at least 12 characters
-- `SESSION_SECRET` set to a strong 32+ character value
-- `EMAIL_PROVIDER` set to a non-dev provider value
-- `SMS_PROVIDER` set to a delivery provider before enabling production phone verification
-
-### Local MySQL
-
-This workspace is configured for the local `root` MySQL account and the `shaw_enterprise` database. The full schema/data import has been generated in `data/shaw-enterprise-mysql.sql`; it includes products, enquiries, feedback, admin accounts, and verification codes. The app mirrors future updates while it is running.
-
-### Google sign-in
-
-Create a **Web application** OAuth client in Google Cloud, add `http://localhost:3000/auth/google/callback` as an authorized redirect URI, then add its values to the ignored `.env` file:
-
-```text
-GOOGLE_CLIENT_ID=...
-GOOGLE_CLIENT_SECRET=...
-GOOGLE_REDIRECT_URI=http://localhost:3000/auth/google/callback
-```
-
-Google sign-in only admits an email that already belongs to a fully verified admin account; it does not let an arbitrary Google account become an administrator.
-
-Optional MySQL live-sync is disabled unless both `MYSQL_SYNC_ENABLED=true` and `MYSQL_PASSWORD` are set.
-
-## Features
-
-- Public pages for Home, Products, Feedback, and Contact
-- Product catalog with 300 seeded products, generated product visuals, prices, detailed product panel, and product-specific reviews
-- Feedback system with email identity verification, replies, likes, hearts, unlike/toggle behavior, sorting, and load more
-- Glossy admin authentication portal with password visibility, account creation, email + phone OTP verification, and password reset API flows
-- Admin panel with product CRUD, feedback moderation, inquiries, and audit logs
-- Admin image picker with local file selection and preview
-- SQLite database created automatically at `data/shaw-enterprise.db`
-- Docker and Render deployment files included
-
-## Notes
-
-OTP verification returns development codes only outside production. Configure real email/SMS delivery providers before enabling public registration in production; `console` is useful only for deployment smoke tests.
-
-## Operations
-
-Create a SQLite backup:
-
-```bash
-npm run db:backup
-```
-
-Export the MySQL Workbench SQL file:
-
-```bash
-npm run db:export:mysql
-```
-
-Backfill/rebuild the MySQL mirror from SQLite:
-
-```bash
-MYSQL_PASSWORD=your_mysql_password npm run db:sync:mysql
-```
-
-Health endpoint:
+Health checks:
 
 ```text
 GET /healthz
+GET /actuator/health
 ```
 
-## MySQL Workbench Database
+## Business details and map
 
-The full MySQL database export is generated at:
+Sign in and open **Admin → Business & Map**. Set the real business name, phone, email, WhatsApp number, opening hours, and exact street address. Saving once updates the footer, contact page, embedded map, and mobile Google Maps directions links for every open visitor session.
 
-```text
-data/shaw-enterprise-mysql.sql
-```
+The navigation link uses Google's cross-platform Maps URL (`api=1`), which opens the Google Maps app on supported phones and does not require an API key. The embedded map also avoids a paid JavaScript Maps SDK key.
 
-The imported database name is:
+The current database still contains placeholder contact details. Production mode intentionally refuses to launch until those are replaced.
 
-```text
-shaw_enterprise
-```
+## Configuration
 
-It includes:
+Copy `.env.example` to `.env` on a new machine and fill in private values. Never commit `.env`.
 
-- `products`
-- `product_images`
-- `product_categories`
-- `admin_users`
-- `admin_audit_logs`
-- `inquiries`
-- `feedback_identities`
-- `feedback_identity_otps`
-- `feedback_comments`
-- `feedback_reactions`
-- `business_settings`
+Important values:
 
-To view it in MySQL Workbench, refresh Schemas and open `shaw_enterprise`.
+- `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DATABASE`, `MYSQL_USER`, `MYSQL_PASSWORD`
+- `ADMIN_USER`, `ADMIN_PASSWORD`
+- `OTP_SECRET`
+- `DEV_EXPOSE_OTP=false` in production
+- `APP_PRODUCTION=true` in production
+- `ALLOW_ADMIN_REGISTRATION=false` except during an owner-approved onboarding window
 
-The running website now live-syncs writes into MySQL. Contact inquiries, admin product create/edit/delete, selected product images, feedback identity OTPs, feedback comments, reactions, moderation actions, login/logout audit entries, and admin audit logs are mirrored into `shaw_enterprise` immediately.
+The local `root` account is suitable only for development. For a sale/deployment, create a least-privilege MySQL user limited to the `shaw_enterprise` schema.
 
-If MySQL Workbench is already showing a result grid, run the `SELECT` query again or click the refresh icon in Workbench to see the latest rows.
+## API summary
 
-## Launch Checklist
+Public:
 
-- Set production `ADMIN_USER`, `ADMIN_PASSWORD`, `SESSION_SECRET`, and `EMAIL_PROVIDER`.
-- Confirm `npm test` passes and `/healthz` returns `ok: true`.
-- Run `npm run db:backup` before deployment.
-- Confirm `/contact` submissions appear in Admin > Inquiries.
-- Confirm Admin can mark inquiries as `new`, `contacted`, or `closed`.
-- Confirm production OTP responses do not include `devOtp`.
-- Deploy with Docker/Render using `npm start`.
+- `GET /api/products`
+- `GET /api/products/{id}`
+- `POST /api/inquiries`
+- `GET /api/feedback`
+- `POST /api/feedback/request-otp`
+- `POST /api/feedback/verify-otp`
+- `POST /api/feedback`
+- `POST /api/feedback/{id}/react`
+- `GET /api/live` (SSE)
+
+Authenticated admin:
+
+- Product CRUD under `/api/admin/products`
+- Enquiry management under `/api/admin/inquiries`
+- Moderation under `/api/admin/feedback`
+- Audit history at `/api/admin/audits`
+- Business/map settings at `/api/admin/settings`
+
+All write endpoints require the CSRF token supplied in the page's `csrf-token` meta element.
+
+## Deployment
+
+Build the included Dockerfile and supply secrets through the host's environment. `render.yaml` lists the required variables. The application automatically validates and migrates the database on startup.
+
+Before enabling `APP_PRODUCTION=true`:
+
+1. Replace every placeholder in **Admin → Business & Map**.
+2. Use unique production database/admin/OTP secrets.
+3. Set `DEV_EXPOSE_OTP=false` and connect a transactional email/SMS provider before offering public OTP flows.
+4. Put the service behind HTTPS and take a MySQL backup.
+5. Run `mvn test`, verify `/healthz`, then perform one enquiry and admin status change.
