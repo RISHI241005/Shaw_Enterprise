@@ -1,21 +1,34 @@
 {
   "name": "shaw-enterprise",
-  "version": "2.0.0",
-  "description": "Spring Boot and MySQL website for Shaw Enterprise.",
+  "version": "3.0.0",
+  "description": "Single-project Vercel storefront and API for Shaw Enterprise, backed by MySQL/TiDB.",
+  "main": "api/index.js",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
-    "start": "mvn spring-boot:run",
-    "dev": "mvn spring-boot:run",
-    "build": "mvn clean package",
-    "test": "mvn test"
+    "start": "node --env-file-if-exists=.env api/index.js",
+    "dev": "node --watch --env-file-if-exists=.env api/index.js",
+    "build": "node --check api/index.js",
+    "vercel-build": "node --check api/index.js",
+    "test": "node --test tests/vercel-app.test.js",
+    "java:test": "mvn test",
+    "java:package": "mvn clean package"
   },
   "keywords": [
     "shaw-enterprise",
     "wholesale",
     "retail",
     "disposable-products",
-    "spring-boot",
-    "mysql"
+    "vercel",
+    "mysql",
+    "tidb",
+    "spring-boot"
   ],
   "author": "Shaw Enterprise",
-  "license": "UNLICENSED"
+  "license": "UNLICENSED",
+  "dependencies": {
+    "express": "^5.1.0",
+    "mysql2": "^3.14.5"
+  }
 }

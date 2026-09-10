@@ -1,6 +1,6 @@
 # Shaw Enterprise
 
-Production-oriented website for a wholesale and retail disposable-products business. The active backend is Java 21 with Spring Boot 4.1.1. MySQL is the only runtime source of truth; the former Node/SQLite prototype remains in the repository only as migration history.
+Production-oriented website for a wholesale and retail disposable-products business. The Vercel deployment is one integrated project: a Node.js serverless function serves the pages and APIs and connects directly to MySQL or MySQL-compatible TiDB Cloud. The Java 21/Spring Boot implementation remains available for traditional container hosting.
 
 ## What works
 
@@ -17,12 +17,13 @@ Production-oriented website for a wholesale and retail disposable-products busin
 
 ## Run locally
 
-Requirements: Java 21, Maven 3.9+, MySQL 8.
+Requirements: Node.js 22+ and MySQL 8 or TiDB Cloud.
 
 The ignored `.env` file is already configured for this computer. It keeps database/admin secrets out of committed source.
 
 ```powershell
-mvn spring-boot:run
+npm install
+npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000). The admin portal is at [http://localhost:3000/login](http://localhost:3000/login).
@@ -30,16 +31,14 @@ Open [http://localhost:3000](http://localhost:3000). The admin portal is at [htt
 To build and test:
 
 ```powershell
-mvn test
-mvn clean package
-java -jar target/shaw-enterprise-2.0.0.jar
+npm test
+npm run build
 ```
 
 Health checks:
 
 ```text
 GET /healthz
-GET /actuator/health
 ```
 
 ## Business details and map
@@ -56,9 +55,10 @@ Copy `.env.example` to `.env` on a new machine and fill in private values. Never
 
 Important values:
 
-- `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DATABASE`, `MYSQL_USER`, `MYSQL_PASSWORD`
+- `DATABASE_URL`, or `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DATABASE`, `MYSQL_USER`, `MYSQL_PASSWORD`
+- Vercel TiDB integration variables `TIDB_HOST`, `TIDB_PORT`, `TIDB_DATABASE`, `TIDB_USER`, `TIDB_PASSWORD`
 - `ADMIN_USER`, `ADMIN_PASSWORD`
-- `OTP_SECRET`
+- `SESSION_SECRET`, `OTP_SECRET`
 - `DEV_EXPOSE_OTP=false` in production
 - `APP_PRODUCTION=true` in production
 - `ALLOW_ADMIN_REGISTRATION=false` except during an owner-approved onboarding window
@@ -89,9 +89,11 @@ Authenticated admin:
 
 All write endpoints require the CSRF token supplied in the page's `csrf-token` meta element.
 
-## Deployment
+## Vercel deployment
 
-Build the included Dockerfile and supply secrets through the host's environment. `render.yaml` lists the required variables. The application automatically validates and migrates the database on startup.
+`vercel.json` routes the complete website through `api/index.js`, so pages and APIs ship as one Vercel project. Connect a MySQL-compatible TiDB Cloud database from Vercel Storage; its `TIDB_*` variables are recognized automatically. The function creates missing tables and seeds the 300-product catalog when the database is empty.
+
+The Node runtime is required on Vercel because Vercel does not provide an official Java/Spring runtime. To run the Java version instead, build the included Dockerfile and deploy it to a container host using `render.yaml`.
 
 Before enabling `APP_PRODUCTION=true`:
 
@@ -99,4 +101,4 @@ Before enabling `APP_PRODUCTION=true`:
 2. Use unique production database/admin/OTP secrets.
 3. Set `DEV_EXPOSE_OTP=false` and connect a transactional email/SMS provider before offering public OTP flows.
 4. Put the service behind HTTPS and take a MySQL backup.
-5. Run `mvn test`, verify `/healthz`, then perform one enquiry and admin status change.
+5. Run `npm test`, verify `/healthz`, then perform one enquiry and admin status change.
