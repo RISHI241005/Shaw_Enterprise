@@ -105,17 +105,25 @@ function relativeTime(value) {
 
 function identityHtml(identity) {
   if (identity?.verified) {
-    return `<div class="feedback-identity-card"><strong>Verified identity</strong><span>${escapeHtml(identity.email)}</span></div>`;
+    const method = identity.channel === "phone" ? "phone" : "email";
+    return `<div class="feedback-identity-card"><strong>Verified ${method}</strong><span>${escapeHtml(identity.contact || identity.email)}</span></div>`;
   }
   return `
     <div class="verify-box">
-      <label>Email<input name="email" type="email" placeholder="your@email.com" required /></label>
+      <div class="verification-heading"><strong>Verify your identity</strong><span>Required before posting</span></div>
+      <label>Verification method
+        <select name="verificationChannel">
+          <option value="email">Email</option>
+          <option value="phone">Phone (SMS)</option>
+        </select>
+      </label>
+      <label><span class="verification-destination-label">Email address</span><input name="verificationDestination" type="email" autocomplete="email" placeholder="your@email.com" required /></label>
       <div class="otp-row">
-        <button class="button ghost request-otp" type="button">Send OTP</button>
-        <input name="otp" inputmode="numeric" placeholder="OTP code" />
+        <button class="button ghost request-otp" type="button">Send code</button>
+        <input name="otp" inputmode="numeric" autocomplete="one-time-code" placeholder="Verification code" />
         <button class="button ghost verify-otp" type="button">Verify</button>
       </div>
-      <p class="form-note">For local testing, the OTP appears here after you click Send OTP.</p>
+      <p class="form-note" aria-live="polite">Choose email or SMS. Include the country code for phone numbers (for example +91 98765 43210).</p>
     </div>`;
 }
 
@@ -127,25 +135,49 @@ function setFeedbackIdentity(identity) {
 }
 
 async function requestOtp(root) {
-  const email = qs("input[name='email']", root)?.value.trim();
-  if (!email) throw new Error("Enter your email first");
+  const channel = qs("select[name='verificationChannel']", root)?.value || "email";
+  const destination = qs("input[name='verificationDestination']", root)?.value.trim();
+  if (!destination) throw new Error(`Enter your ${channel === "phone" ? "phone number" : "email address"} first`);
   const result = await fetchJson("/api/feedback/request-otp", {
     method: "POST",
-    body: JSON.stringify({ email })
+    body: JSON.stringify(channel === "phone" ? { channel, phone: destination } : { channel, email: destination })
   });
   const note = qs(".form-note", root) || qs("#otpNote");
-  if (note) note.textContent = result.devOtp ? `Local test OTP: ${result.devOtp}` : result.message;
+  if (note) {
+    note.classList.remove("error");
+    note.textContent = result.devOtp ? `Local test code: ${result.devOtp}` : result.message;
+  }
 }
 
 async function verifyOtp(root) {
-  const email = qs("input[name='email']", root)?.value.trim();
+  const channel = qs("select[name='verificationChannel']", root)?.value || "email";
+  const destination = qs("input[name='verificationDestination']", root)?.value.trim();
   const otp = qs("input[name='otp']", root)?.value.trim();
-  if (!email || !otp) throw new Error("Enter email and OTP");
+  if (!destination || !otp) throw new Error(`Enter your ${channel === "phone" ? "phone number" : "email address"} and verification code`);
   const result = await fetchJson("/api/feedback/verify-otp", {
     method: "POST",
-    body: JSON.stringify({ email, otp })
+    body: JSON.stringify(channel === "phone" ? { channel, phone: destination, otp } : { channel, email: destination, otp })
   });
   setFeedbackIdentity(result.identity);
+}
+
+function updateVerificationForm(select) {
+  const root = select.closest(".verify-box");
+  const input = qs("input[name='verificationDestination']", root);
+  const label = qs(".verification-destination-label", root);
+  if (!input || !label) return;
+  const phone = select.value === "phone";
+  label.textContent = phone ? "Mobile number" : "Email address";
+  input.type = phone ? "tel" : "email";
+  input.autocomplete = phone ? "tel" : "email";
+  input.placeholder = phone ? "+91 98765 43210" : "your@email.com";
+  input.value = "";
+  qs("input[name='otp']", root).value = "";
+  const note = qs(".form-note", root);
+  if (note) {
+    note.classList.remove("error");
+    note.textContent = phone ? "We will text a one-time code. Include your country code." : "We will email a one-time verification code.";
+  }
 }
 
 function reactionButtons(item) {
@@ -364,7 +396,7 @@ async function reactToFeedback(button) {
 }
 
 async function postFeedback(form, productId = "") {
-  if (!state.feedbackIdentity?.verified) throw new Error("Verify your email first");
+  if (!state.feedbackIdentity?.verified) throw new Error("Verify your email or phone first");
   const message = form.elements.message.value.trim();
   const parentId = form.dataset.parentId || "";
   await fetchJson("/api/feedback", {
@@ -682,8 +714,20 @@ document.addEventListener("click", async (event) => {
       renderAuditLog(result.auditLogs);
     }
   } catch (error) {
-    alert(error.message);
+    if (target.matches(".request-otp, .verify-otp")) {
+      const note = qs(".form-note", target.closest("form") || target.closest(".verify-box")) || qs("#otpNote");
+      if (note) {
+        note.textContent = error.message;
+        note.classList.add("error");
+      }
+    } else {
+      alert(error.message);
+    }
   }
+});
+
+document.addEventListener("change", (event) => {
+  if (event.target.matches("select[name='verificationChannel']")) updateVerificationForm(event.target);
 });
 
 document.addEventListener("submit", async (event) => {

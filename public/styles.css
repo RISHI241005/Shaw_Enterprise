@@ -558,8 +558,12 @@ textarea { resize: vertical; }
   background: #f8faf5;
 }
 .feedback-identity-card { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.verify-box { display: grid; gap: 10px; }
+.verification-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.verification-heading span { color: var(--muted); font-size: 12px; font-weight: 800; }
 .otp-row { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: end; margin-top: 10px; }
 .form-note { margin: 4px 0 0; color: var(--blue); font-size: 13px; font-weight: 700; }
+.form-note.error { color: #9f2d24; }
 .empty { color: var(--muted); }
 
 .admin-shell { display: grid; gap: 22px; }

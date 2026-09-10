@@ -59,6 +59,8 @@ Important values:
 - Vercel TiDB integration variables `TIDB_HOST`, `TIDB_PORT`, `TIDB_DATABASE`, `TIDB_USER`, `TIDB_PASSWORD`
 - `ADMIN_USER`, `ADMIN_PASSWORD`
 - `SESSION_SECRET`, `OTP_SECRET`
+- Email OTP: `RESEND_API_KEY` and a verified `EMAIL_FROM`
+- Phone/SMS OTP: `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_VERIFY_SERVICE_SID`
 - `DEV_EXPOSE_OTP=false` in production
 - `APP_PRODUCTION=true` in production
 - `ALLOW_ADMIN_REGISTRATION=false` except during an owner-approved onboarding window
@@ -73,8 +75,8 @@ Public:
 - `GET /api/products/{id}`
 - `POST /api/inquiries`
 - `GET /api/feedback`
-- `POST /api/feedback/request-otp`
-- `POST /api/feedback/verify-otp`
+- `POST /api/feedback/request-otp` (email or phone/SMS)
+- `POST /api/feedback/verify-otp` (email or phone/SMS)
 - `POST /api/feedback`
 - `POST /api/feedback/{id}/react`
 - `GET /api/live` (SSE)
@@ -99,6 +101,6 @@ Before enabling `APP_PRODUCTION=true`:
 
 1. Replace every placeholder in **Admin → Business & Map**.
 2. Use unique production database/admin/OTP secrets.
-3. Set `DEV_EXPOSE_OTP=false` and connect a transactional email/SMS provider before offering public OTP flows.
+3. Set `DEV_EXPOSE_OTP=false` and configure Resend for email OTP and/or a Twilio Verify Service for phone OTP.
 4. Put the service behind HTTPS and take a MySQL backup.
 5. Run `npm test`, verify `/healthz`, then perform one enquiry and admin status change.

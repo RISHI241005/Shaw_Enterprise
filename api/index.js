@@ -72,7 +72,7 @@ async function ensureSchema() {
       `CREATE TABLE IF NOT EXISTS products (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, category_id BIGINT UNSIGNED NOT NULL, name VARCHAR(180) NOT NULL, sku VARCHAR(60) NOT NULL UNIQUE, price_label VARCHAR(80) NOT NULL, product_type VARCHAR(160) NOT NULL, summary TEXT NOT NULL, details TEXT NOT NULL, pack_size VARCHAR(160) NOT NULL, audience VARCHAR(180) NOT NULL, featured BOOLEAN NOT NULL DEFAULT FALSE, status VARCHAR(20) NOT NULL DEFAULT 'active', created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, INDEX idx_products_category(category_id), INDEX idx_products_featured(featured))`,
       `CREATE TABLE IF NOT EXISTS product_images (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, product_id BIGINT UNSIGNED NOT NULL, image_data LONGTEXT NOT NULL, alt_text VARCHAR(220) NOT NULL, sort_order INT NOT NULL DEFAULT 0, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_product_images_product(product_id))`,
       `CREATE TABLE IF NOT EXISTS inquiries (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, name VARCHAR(160) NOT NULL, email VARCHAR(180) NOT NULL, phone VARCHAR(60) NOT NULL, message TEXT NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'new', created_at DATETIME NOT NULL, INDEX idx_inquiries_status_created(status, created_at))`,
-      `CREATE TABLE IF NOT EXISTS feedback_identities (visitor_id VARCHAR(80) PRIMARY KEY, email VARCHAR(180) NOT NULL, verified BOOLEAN NOT NULL DEFAULT FALSE, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, INDEX idx_feedback_identity_email(email))`,
+      `CREATE TABLE IF NOT EXISTS feedback_identities (visitor_id VARCHAR(80) PRIMARY KEY, email VARCHAR(180) NOT NULL, verification_channel VARCHAR(20) NOT NULL DEFAULT 'email', verified BOOLEAN NOT NULL DEFAULT FALSE, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, INDEX idx_feedback_identity_email(email))`,
       `CREATE TABLE IF NOT EXISTS feedback_identity_otps (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, visitor_id VARCHAR(80) NOT NULL, email VARCHAR(180) NOT NULL, otp_hash VARCHAR(255) NOT NULL, expires_at DATETIME NOT NULL, used_at DATETIME NULL, created_at DATETIME NOT NULL, INDEX idx_feedback_otps_visitor(visitor_id, created_at))`,
       `CREATE TABLE IF NOT EXISTS feedback_comments (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, visitor_id VARCHAR(80) NOT NULL, author_email VARCHAR(180) NOT NULL, message TEXT NOT NULL, parent_id BIGINT UNSIGNED NULL, product_id BIGINT UNSIGNED NULL, status VARCHAR(20) NOT NULL DEFAULT 'visible', created_at DATETIME NOT NULL, INDEX idx_feedback_parent(parent_id), INDEX idx_feedback_product(product_id))`,
       `CREATE TABLE IF NOT EXISTS feedback_reactions (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, feedback_id BIGINT UNSIGNED NOT NULL, visitor_id VARCHAR(80) NOT NULL, reaction VARCHAR(20) NOT NULL, created_at DATETIME NOT NULL, UNIQUE KEY uq_feedback_reaction_visitor(feedback_id, visitor_id))`,
@@ -81,6 +81,14 @@ async function ensureSchema() {
       `CREATE TABLE IF NOT EXISTS sync_state (topic VARCHAR(40) PRIMARY KEY, version BIGINT NOT NULL DEFAULT 0, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)`
     ];
     for (const sql of statements) await q(sql);
+    const identityChannel = await one("SELECT COUNT(*) count FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='feedback_identities' AND COLUMN_NAME='verification_channel'");
+    if (!Number(identityChannel?.count || 0)) {
+      try {
+        await q("ALTER TABLE feedback_identities ADD COLUMN verification_channel VARCHAR(20) NOT NULL DEFAULT 'email' AFTER email");
+      } catch (error) {
+        if (Number(error?.errno) !== 1060) throw error;
+      }
+    }
     await q(`INSERT IGNORE INTO business_settings(setting_key,setting_value) VALUES
       ('business_name','Shaw Enterprise'),('phone','+91 00000 00000'),('email','sales@shawenterprise.example'),
       ('address','Kolkata, West Bengal, India'),('whatsapp','910000000000'),('hours','Monday to Saturday, 10:00 AM–7:00 PM')`);
@@ -145,8 +153,39 @@ function rateLimit(req, bucket, limit = 30, windowMs = 60000) {
 }
 function escapeHtml(value = "") { return String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]); }
 function safeEmail(email = "") { const [name, domain] = String(email).split("@"); return name && domain ? `${name.slice(0, 2)}***@${domain}` : "Verified customer"; }
+function normalizeEmail(value = "") {
+  const email = String(value).trim().toLowerCase();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 180 ? email : null;
+}
+function normalizePhone(value = "") {
+  const input = String(value).trim();
+  const compact = input.replace(/[\s().-]/g, "");
+  const phone = /^\d{10}$/.test(compact) ? `+91${compact}` : compact;
+  return /^\+[1-9]\d{7,14}$/.test(phone) ? phone : null;
+}
+function safeContact(value = "") {
+  const contact = String(value);
+  if (contact.includes("@")) return safeEmail(contact);
+  const phone = normalizePhone(contact);
+  return phone ? `${phone.slice(0, Math.min(3, phone.length - 4))}*****${phone.slice(-4)}` : "Verified customer";
+}
 function otpHash(code) { return crypto.createHmac("sha256", OTP_SECRET).update(code).digest("hex"); }
 function asyncRoute(handler) { return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next); }
+class PublicError extends Error {
+  constructor(statusCode, message) {
+    super(message);
+    this.name = "PublicError";
+    this.statusCode = statusCode;
+    this.isPublic = true;
+  }
+}
+
+function publicIdentity(identity) {
+  if (!identity) return null;
+  const channel = identity.verification_channel === "phone" ? "phone" : "email";
+  const contact = safeContact(identity.email);
+  return { channel, contact, email: contact, verified: Boolean(identity.verified) };
+}
 
 async function products() {
   const rows = await q(`SELECT p.*, c.name category FROM products p JOIN product_categories c ON c.id=p.category_id WHERE p.status='active' ORDER BY p.featured DESC,p.id`);
@@ -179,7 +218,7 @@ async function feedbackThreads(visitorId, options = {}) {
   const reactionRows = ids.length ? await q(`SELECT feedback_id,visitor_id,reaction FROM feedback_reactions WHERE feedback_id IN (${ids.map(() => "?").join(",")})`, ids) : [];
   const items = new Map(rows.map((row) => {
     const reactions = reactionRows.filter((reaction) => Number(reaction.feedback_id) === Number(row.id));
-    return [Number(row.id), { id: Number(row.id), authorEmail: row.author_email, displayLabel: safeEmail(row.author_email), message: row.message, parentId: row.parent_id ? Number(row.parent_id) : null, productId: row.product_id ? Number(row.product_id) : null, status: row.status, createdAt: row.created_at, reactions: { like: reactions.filter((r) => r.reaction === "like").length, heart: reactions.filter((r) => r.reaction === "heart").length }, myReaction: reactions.find((r) => r.visitor_id === visitorId)?.reaction || null, replies: [] }];
+    return [Number(row.id), { id: Number(row.id), authorEmail: row.author_email, displayLabel: safeContact(row.author_email), message: row.message, parentId: row.parent_id ? Number(row.parent_id) : null, productId: row.product_id ? Number(row.product_id) : null, status: row.status, createdAt: row.created_at, reactions: { like: reactions.filter((r) => r.reaction === "like").length, heart: reactions.filter((r) => r.reaction === "heart").length }, myReaction: reactions.find((r) => r.visitor_id === visitorId)?.reaction || null, replies: [] }];
   }));
   const roots = [];
   for (const item of items.values()) { if (item.parentId && items.has(item.parentId)) items.get(item.parentId).replies.unshift(item); else roots.push(item); }
@@ -238,7 +277,7 @@ app.get("/products", asyncRoute(async (req, res) => {
   const [items, info] = await Promise.all([products(), business()]); const categories = [...new Set(items.map((item) => item.category))];
   res.send(layout("Products", `<section class="page-title catalog-title"><p class="eyebrow">Curated product catalog</p><h1>Everything your business needs, in one place.</h1><p>Browse dependable everyday disposables for shops, events, delivery, and food service.</p></section><section class="band"><div class="catalog-toolbar"><div class="catalog-toolbar-top"><label class="catalog-search-field"><span>⌕</span><input id="productSearch" type="search" placeholder="Search products, categories or uses"></label><label class="catalog-sort-field"><span>Sort</span><select id="productSort"><option value="featured">Featured first</option><option value="name-asc">Name: A–Z</option><option value="name-desc">Name: Z–A</option></select></label></div><div class="catalog-filter-row"><button class="filter-chip active" type="button" data-category="all">All <span>${items.length}</span></button>${categories.map((category) => `<button class="filter-chip" type="button" data-category="${escapeHtml(category.toLowerCase())}">${escapeHtml(category)}</button>`).join("")}</div><div class="catalog-status"><p id="catalogCount">Showing all ${items.length} products</p><p class="catalog-empty" hidden>No products found.</p></div></div><div class="product-grid" id="productGrid">${items.map(productCard).join("")}</div></section><aside class="product-panel" id="productPanel" aria-hidden="true"></aside>`, req, info));
 }));
-app.get("/feedback", asyncRoute(async (req, res) => { const [identity, info] = await Promise.all([one("SELECT email,verified FROM feedback_identities WHERE visitor_id=?", [req.visitorId]), business()]); const publicIdentity = identity ? { email: safeEmail(identity.email), verified: Boolean(identity.verified) } : null; res.send(layout("Feedback", `<section class="page-title compact"><p class="eyebrow">Community feedback</p><h1>Customer feedback and product reviews.</h1></section><section class="feedback-shell" data-identity='${escapeHtml(JSON.stringify(publicIdentity))}'><form class="feedback-form" id="feedbackForm"><div id="feedbackIdentity"></div><label>Feedback<textarea name="message" rows="4" placeholder="Share your experience" required maxlength="5000"></textarea></label><button class="button primary" type="submit">Post Feedback</button><p class="form-note" id="otpNote"></p></form><div class="feedback-toolbar"><strong>Comments</strong><select id="feedbackSort"><option value="top">Top</option><option value="newest">Newest</option></select></div><div id="feedbackList" class="feedback-list"></div><button class="button ghost" id="loadMoreFeedback" type="button">Load More</button></section>`, req, info)); }));
+app.get("/feedback", asyncRoute(async (req, res) => { const [identity, info] = await Promise.all([one("SELECT email,verification_channel,verified FROM feedback_identities WHERE visitor_id=?", [req.visitorId]), business()]); const identityView = publicIdentity(identity); res.send(layout("Feedback", `<section class="page-title compact"><p class="eyebrow">Community feedback</p><h1>Customer feedback and product reviews.</h1></section><section class="feedback-shell" data-identity='${escapeHtml(JSON.stringify(identityView))}'><form class="feedback-form" id="feedbackForm"><div id="feedbackIdentity"></div><label>Feedback<textarea name="message" rows="4" placeholder="Share your experience" required maxlength="5000"></textarea></label><button class="button primary" type="submit">Post Feedback</button><p class="form-note" id="otpNote"></p></form><div class="feedback-toolbar"><strong>Comments</strong><select id="feedbackSort"><option value="top">Top</option><option value="newest">Newest</option></select></div><div id="feedbackList" class="feedback-list"></div><button class="button ghost" id="loadMoreFeedback" type="button">Load More</button></section>`, req, info)); }));
 app.get("/contact", asyncRoute(async (req, res) => { const info = await business(); res.send(layout("Contact", `<section class="page-title compact"><p class="eyebrow">Contact & directions</p><h1>Send an enquiry or plan your visit.</h1></section><section class="contact-layout"><form class="contact-form"><label>Name<input name="name" required maxlength="160"></label><label>Email<input name="email" type="email" required maxlength="180"></label><label>Phone<input name="phone" required maxlength="60"></label><label>Message<textarea name="message" rows="5" required maxlength="5000"></textarea></label><button class="button primary" type="submit">Send Enquiry</button><p class="form-note contact-note"></p></form><aside class="contact-card"><p class="eyebrow">Business details</p><h2>${escapeHtml(info.business_name)}</h2><a class="contact-detail" href="tel:${escapeHtml(info.phone)}">${escapeHtml(info.phone)}</a><a class="contact-detail" href="mailto:${escapeHtml(info.email)}">${escapeHtml(info.email)}</a><p>${escapeHtml(info.address)}</p><p>${escapeHtml(info.hours)}</p><div class="contact-actions"><a class="button primary" href="${info.mapDirectionsUrl}" target="_blank" rel="noopener">Get directions</a><a class="button ghost" href="https://wa.me/${info.whatsapp}" target="_blank" rel="noopener">Open WhatsApp</a></div></aside><div class="map-card"><iframe src="${info.mapEmbedUrl}" title="Shaw Enterprise location" loading="lazy" allowfullscreen></iframe><div><strong>Open on your phone</strong><p>Google Maps will guide you to the enterprise.</p><a class="button ghost" href="${info.mapDirectionsUrl}" target="_blank" rel="noopener">Navigate with Google Maps</a></div></div></section>`, req, info)); }));
 
 app.get("/login", asyncRoute(async (req, res) => { const info = await business(); res.send(layout("Admin Login", `<section class="auth-wrap"><div class="auth-shell"><aside class="auth-intro"><img src="/logo.svg" alt="Shaw Enterprise"><p class="eyebrow">Secure workspace</p><h1>Manage the business with confidence.</h1><p>Protected access and one control centre for your team.</p></aside><div class="auth-card"><div class="auth-card-head"><p class="eyebrow">Administrator portal</p><h2>Welcome back</h2></div><p class="auth-status" id="authStatus"></p><form id="loginForm" class="auth-form"><label>Username<input name="username" autocomplete="username" required></label><label>Password<span class="password-field"><input name="password" type="password" autocomplete="current-password" required><button class="password-toggle" type="button">Show</button></span></label><button class="button primary auth-submit" type="submit">Sign in securely <span>→</span></button></form></div></div></section>`, req, info)); }));
@@ -261,18 +300,106 @@ app.get("/api/products", asyncRoute(async (_req, res) => res.json({ products: aw
 app.get("/api/products/:id", asyncRoute(async (req, res) => { const item = await product(req.params.id); if (!item) return res.status(404).json({ error: "Product not found" }); res.json({ product: item, reviews: await feedbackThreads(req.visitorId, { productId: item.id, sort: "top" }) }); }));
 app.post("/api/inquiries", requireCsrf, asyncRoute(async (req, res) => { if (!rateLimit(req, "inquiry", 8, 600000)) return res.status(429).json({ error: "Too many enquiries" }); const { name, email, phone, message } = req.body; if (![name,email,phone,message].every((value) => String(value || "").trim())) return res.status(400).json({ error: "All enquiry fields are required" }); const result = await q("INSERT INTO inquiries(name,email,phone,message,status,created_at) VALUES (?,?,?,?, 'new',?)", [String(name).trim(),String(email).trim(),String(phone).trim(),String(message).trim(),now()]); await bump("inquiries"); res.status(201).json({ inquiry: { id: result.insertId, name: String(name).trim() }, message: "Enquiry saved" }); }));
 
-async function deliverOtp(email, code) {
-  if (process.env.RESEND_API_KEY && process.env.EMAIL_FROM) {
-    const response = await fetch("https://api.resend.com/emails", { method: "POST", headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, "Content-Type": "application/json" }, body: JSON.stringify({ from: process.env.EMAIL_FROM, to: [email], subject: "Your Shaw Enterprise verification code", text: `Your verification code is ${code}. It expires in 10 minutes.` }) });
-    if (!response.ok) throw new Error("Verification email could not be delivered"); return {};
+async function deliverEmailOtp(email, code) {
+  if (!process.env.RESEND_API_KEY || !process.env.EMAIL_FROM) {
+    if (DEV_EXPOSE_OTP && !IS_PRODUCTION) return { devOtp: code };
+    throw new PublicError(503, "Email verification is temporarily unavailable. Choose phone verification or try again later.");
   }
-  if (DEV_EXPOSE_OTP && !IS_PRODUCTION) return { devOtp: code };
-  throw new Error("Email verification is not configured");
+  try {
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ from: process.env.EMAIL_FROM, to: [email], subject: "Your Shaw Enterprise verification code", text: `Your verification code is ${code}. It expires in 10 minutes.` }),
+      signal: AbortSignal.timeout(12000)
+    });
+    if (!response.ok) throw new PublicError(502, "The verification email could not be delivered. Check the address or choose phone verification.");
+    return {};
+  } catch (error) {
+    if (error instanceof PublicError) throw error;
+    throw new PublicError(502, "The email service is unavailable right now. Choose phone verification or try again later.");
+  }
 }
-app.post("/api/feedback/request-otp", requireCsrf, asyncRoute(async (req, res) => { if (!rateLimit(req, "otp", 5, 600000)) return res.status(429).json({ error: "Too many OTP requests" }); const email = String(req.body.email || "").trim().toLowerCase(); if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "Valid email is required" }); const code = String(Math.floor(100000 + Math.random() * 900000)); await q("INSERT INTO feedback_identity_otps(visitor_id,email,otp_hash,expires_at,created_at) VALUES (?,?,?,?,?)", [req.visitorId,email,otpHash(code),new Date(Date.now()+600000),now()]); const delivery = await deliverOtp(email, code); res.json({ message: "OTP sent", ...delivery }); }));
-app.post("/api/feedback/verify-otp", requireCsrf, asyncRoute(async (req, res) => { const email = String(req.body.email || "").trim().toLowerCase(), code = String(req.body.otp || "").trim(); const row = await one("SELECT * FROM feedback_identity_otps WHERE visitor_id=? AND email=? AND used_at IS NULL ORDER BY id DESC LIMIT 1", [req.visitorId,email]); if (!row || new Date(row.expires_at) < now() || row.otp_hash !== otpHash(code)) return res.status(400).json({ error: "Invalid or expired OTP" }); await q("UPDATE feedback_identity_otps SET used_at=? WHERE id=?", [now(),row.id]); await q("INSERT INTO feedback_identities(visitor_id,email,verified,created_at,updated_at) VALUES (?,?,1,?,?) ON DUPLICATE KEY UPDATE email=VALUES(email),verified=1,updated_at=VALUES(updated_at)", [req.visitorId,email,now(),now()]); res.json({ identity: { email: safeEmail(email), verified: true } }); }));
-app.get("/api/feedback", asyncRoute(async (req, res) => { const identity = await one("SELECT email,verified FROM feedback_identities WHERE visitor_id=?", [req.visitorId]); res.json({ identity: identity ? { email: safeEmail(identity.email), verified: Boolean(identity.verified) } : null, threads: await feedbackThreads(req.visitorId, { sort: req.query.sort || "top", productId: null }) }); }));
-app.post("/api/feedback", requireCsrf, asyncRoute(async (req, res) => { const identity = await one("SELECT email,verified FROM feedback_identities WHERE visitor_id=?", [req.visitorId]); if (!identity?.verified) return res.status(403).json({ error: "Please verify your email before posting" }); const message = String(req.body.message || "").trim(); if (message.length < 3) return res.status(400).json({ error: "Feedback is too short" }); await q("INSERT INTO feedback_comments(visitor_id,author_email,message,parent_id,product_id,status,created_at) VALUES (?,?,?,?,?,'visible',?)", [req.visitorId,identity.email,message,req.body.parentId ? Number(req.body.parentId) : null,req.body.productId ? Number(req.body.productId) : null,now()]); await bump("feedback"); res.status(201).json({ ok: true }); }));
+
+function twilioCredentials() {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  const serviceSid = process.env.TWILIO_VERIFY_SERVICE_SID;
+  if (!accountSid || !authToken || !serviceSid) {
+    throw new PublicError(503, "Phone verification is being set up. Choose email verification or try again later.");
+  }
+  return { accountSid, authToken, serviceSid };
+}
+
+async function twilioVerifyRequest(pathname, values) {
+  const { accountSid, authToken, serviceSid } = twilioCredentials();
+  try {
+    return await fetch(`https://verify.twilio.com/v2/Services/${encodeURIComponent(serviceSid)}/${pathname}`, {
+      method: "POST",
+      headers: { Authorization: `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`, "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(values),
+      signal: AbortSignal.timeout(12000)
+    });
+  } catch (_error) {
+    throw new PublicError(502, "The SMS service is unavailable right now. Choose email verification or try again later.");
+  }
+}
+
+async function deliverPhoneOtp(phone) {
+  const response = await twilioVerifyRequest("Verifications", { To: phone, Channel: "sms" });
+  if (response.status === 429) throw new PublicError(429, "Too many SMS attempts. Wait a few minutes and try again.");
+  if (!response.ok) throw new PublicError(502, "The verification text could not be delivered. Check the phone number and country code.");
+}
+
+async function checkPhoneOtp(phone, code) {
+  const response = await twilioVerifyRequest("VerificationCheck", { To: phone, Code: code });
+  if ([400, 404].includes(response.status)) return false;
+  if (response.status === 429) throw new PublicError(429, "Too many verification attempts. Wait a few minutes and try again.");
+  if (!response.ok) throw new PublicError(502, "The SMS verification service is unavailable right now.");
+  const result = await response.json();
+  return result.status === "approved";
+}
+
+async function saveVerifiedIdentity(visitorId, destination, channel) {
+  await q("INSERT INTO feedback_identities(visitor_id,email,verification_channel,verified,created_at,updated_at) VALUES (?,?,?,1,?,?) ON DUPLICATE KEY UPDATE email=VALUES(email),verification_channel=VALUES(verification_channel),verified=1,updated_at=VALUES(updated_at)", [visitorId,destination,channel,now(),now()]);
+  return publicIdentity({ email: destination, verification_channel: channel, verified: true });
+}
+
+app.post("/api/feedback/request-otp", requireCsrf, asyncRoute(async (req, res) => {
+  if (!rateLimit(req, "otp", 5, 600000)) return res.status(429).json({ error: "Too many OTP requests. Wait a few minutes and try again." });
+  const channel = req.body.channel === "phone" || (!req.body.email && req.body.phone) ? "phone" : "email";
+  if (channel === "phone") {
+    const phone = normalizePhone(req.body.phone || req.body.destination);
+    if (!phone) return res.status(400).json({ error: "Enter a valid phone number with country code, for example +91 98765 43210." });
+    await deliverPhoneOtp(phone);
+    return res.json({ message: `Verification code sent by SMS to ${safeContact(phone)}.` });
+  }
+  const email = normalizeEmail(req.body.email || req.body.destination);
+  if (!email) return res.status(400).json({ error: "Enter a valid email address." });
+  const code = String(crypto.randomInt(100000, 1000000));
+  const delivery = await deliverEmailOtp(email, code);
+  await q("INSERT INTO feedback_identity_otps(visitor_id,email,otp_hash,expires_at,created_at) VALUES (?,?,?,?,?)", [req.visitorId,email,otpHash(code),new Date(Date.now()+600000),now()]);
+  return res.json({ message: `Verification code sent to ${safeContact(email)}.`, ...delivery });
+}));
+
+app.post("/api/feedback/verify-otp", requireCsrf, asyncRoute(async (req, res) => {
+  const channel = req.body.channel === "phone" || (!req.body.email && req.body.phone) ? "phone" : "email";
+  const code = String(req.body.otp || "").trim();
+  if (!/^\d{4,10}$/.test(code)) return res.status(400).json({ error: "Enter the verification code you received." });
+  if (channel === "phone") {
+    const phone = normalizePhone(req.body.phone || req.body.destination);
+    if (!phone) return res.status(400).json({ error: "Enter a valid phone number with country code." });
+    if (!await checkPhoneOtp(phone, code)) return res.status(400).json({ error: "Invalid or expired verification code." });
+    return res.json({ identity: await saveVerifiedIdentity(req.visitorId, phone, "phone") });
+  }
+  const email = normalizeEmail(req.body.email || req.body.destination);
+  if (!email) return res.status(400).json({ error: "Enter a valid email address." });
+  const row = await one("SELECT * FROM feedback_identity_otps WHERE visitor_id=? AND email=? AND used_at IS NULL ORDER BY id DESC LIMIT 1", [req.visitorId,email]);
+  if (!row || new Date(row.expires_at) < now() || row.otp_hash !== otpHash(code)) return res.status(400).json({ error: "Invalid or expired verification code." });
+  await q("UPDATE feedback_identity_otps SET used_at=? WHERE id=?", [now(),row.id]);
+  return res.json({ identity: await saveVerifiedIdentity(req.visitorId, email, "email") });
+}));
+app.get("/api/feedback", asyncRoute(async (req, res) => { const identity = await one("SELECT email,verification_channel,verified FROM feedback_identities WHERE visitor_id=?", [req.visitorId]); res.json({ identity: publicIdentity(identity), threads: await feedbackThreads(req.visitorId, { sort: req.query.sort || "top", productId: null }) }); }));
+app.post("/api/feedback", requireCsrf, asyncRoute(async (req, res) => { const identity = await one("SELECT email,verification_channel,verified FROM feedback_identities WHERE visitor_id=?", [req.visitorId]); if (!identity?.verified) return res.status(403).json({ error: "Please verify your email or phone before posting." }); const message = String(req.body.message || "").trim(); if (message.length < 3) return res.status(400).json({ error: "Feedback is too short" }); await q("INSERT INTO feedback_comments(visitor_id,author_email,message,parent_id,product_id,status,created_at) VALUES (?,?,?,?,?,'visible',?)", [req.visitorId,identity.email,message,req.body.parentId ? Number(req.body.parentId) : null,req.body.productId ? Number(req.body.productId) : null,now()]); await bump("feedback"); res.status(201).json({ ok: true }); }));
 app.post("/api/feedback/:id/react", requireCsrf, asyncRoute(async (req, res) => { const id = Number(req.params.id), reaction = req.body.reaction === "heart" ? "heart" : "like"; const existing = await one("SELECT id,reaction FROM feedback_reactions WHERE feedback_id=? AND visitor_id=?", [id,req.visitorId]); if (existing?.reaction === reaction) await q("DELETE FROM feedback_reactions WHERE id=?", [existing.id]); else await q("INSERT INTO feedback_reactions(feedback_id,visitor_id,reaction,created_at) VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE reaction=VALUES(reaction),created_at=VALUES(created_at)", [id,req.visitorId,reaction,now()]); await bump("feedback"); res.json({ message: "Reaction saved" }); }));
 
 app.post("/api/auth/login", requireCsrf, asyncRoute(async (req, res) => { if (!rateLimit(req, "login", 10, 600000)) return res.status(429).json({ error: "Too many login attempts" }); const username = String(req.body.username || ""), password = String(req.body.password || ""); const userMatch = username === ADMIN_USER, passA = Buffer.from(password), passB = Buffer.from(ADMIN_PASSWORD); const passMatch = passA.length === passB.length && crypto.timingSafeEqual(passA, passB); if (!userMatch || !passMatch) { await audit(req,"login_failed","admin",username,"Invalid login attempt"); return res.status(401).json({ error: "Invalid username or password" }); } res.cookie("shaw_admin", signed(`admin:${Date.now()}`), { httpOnly: true, sameSite: "lax", secure: IS_PRODUCTION, maxAge: 8*3600000 }); await audit(req,"login","admin",username,"Admin login successful"); res.json({ redirect: "/admin" }); }));
@@ -284,9 +411,9 @@ app.put("/api/admin/products/:id", requireCsrf, asyncRoute(async (req,res) => { 
 app.delete("/api/admin/products/:id", requireCsrf, asyncRoute(async (req,res) => { const id=Number(req.params.id); await q("DELETE FROM product_images WHERE product_id=?",[id]); await q("DELETE FROM products WHERE id=?",[id]); await audit(req,"delete","product",id,"Product deleted"); await bump("products"); res.json({products:await products(),auditLogs:await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80")}); }));
 app.get("/api/admin/inquiries", asyncRoute(async (_req,res) => res.json({inquiries:await q("SELECT * FROM inquiries ORDER BY id DESC LIMIT 100"),auditLogs:await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80")})));
 app.post("/api/admin/inquiries/:id/status", requireCsrf, asyncRoute(async (req,res) => { const status=["new","contacted","closed"].includes(req.body.status)?req.body.status:null; if(!status)return res.status(400).json({error:"Invalid status"}); await q("UPDATE inquiries SET status=? WHERE id=?",[status,Number(req.params.id)]); await audit(req,"status","inquiry",req.params.id,status); await bump("inquiries"); res.json({inquiries:await q("SELECT * FROM inquiries ORDER BY id DESC LIMIT 100"),auditLogs:await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80")}); }));
-app.get("/api/admin/feedback", asyncRoute(async (_req,res) => { const rows=await q("SELECT fc.*,p.name product_name FROM feedback_comments fc LEFT JOIN products p ON p.id=fc.product_id ORDER BY fc.created_at DESC LIMIT 100"); res.json({feedback:rows.map((row)=>({id:Number(row.id),displayLabel:safeEmail(row.author_email),message:row.message,status:row.status,productName:row.product_name||"General feedback",createdAt:row.created_at})),auditLogs:await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80")}); }));
-app.post("/api/admin/feedback/:id/hide", requireCsrf, asyncRoute(async (req,res) => { const row=await one("SELECT status FROM feedback_comments WHERE id=?",[Number(req.params.id)]); const status=row?.status==="hidden"?"visible":"hidden"; await q("UPDATE feedback_comments SET status=? WHERE id=?",[status,Number(req.params.id)]); await audit(req,status==="hidden"?"hide":"restore","feedback",req.params.id,`Feedback ${status}`); await bump("feedback"); const rows=await q("SELECT fc.*,p.name product_name FROM feedback_comments fc LEFT JOIN products p ON p.id=fc.product_id ORDER BY fc.created_at DESC LIMIT 100"); res.json({feedback:rows.map((item)=>({id:Number(item.id),displayLabel:safeEmail(item.author_email),message:item.message,status:item.status,productName:item.product_name||"General feedback",createdAt:item.created_at})),auditLogs:await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80")}); }));
-app.delete("/api/admin/feedback/:id", requireCsrf, asyncRoute(async (req,res) => { const id=Number(req.params.id); await q("DELETE FROM feedback_reactions WHERE feedback_id=?",[id]); await q("DELETE FROM feedback_comments WHERE parent_id=?",[id]); await q("DELETE FROM feedback_comments WHERE id=?",[id]); await audit(req,"delete","feedback",id,"Feedback deleted"); await bump("feedback"); const rows=await q("SELECT fc.*,p.name product_name FROM feedback_comments fc LEFT JOIN products p ON p.id=fc.product_id ORDER BY fc.created_at DESC LIMIT 100"); res.json({feedback:rows.map((item)=>({id:Number(item.id),displayLabel:safeEmail(item.author_email),message:item.message,status:item.status,productName:item.product_name||"General feedback",createdAt:item.created_at})),auditLogs:await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80")}); }));
+app.get("/api/admin/feedback", asyncRoute(async (_req,res) => { const rows=await q("SELECT fc.*,p.name product_name FROM feedback_comments fc LEFT JOIN products p ON p.id=fc.product_id ORDER BY fc.created_at DESC LIMIT 100"); res.json({feedback:rows.map((row)=>({id:Number(row.id),displayLabel:safeContact(row.author_email),message:row.message,status:row.status,productName:row.product_name||"General feedback",createdAt:row.created_at})),auditLogs:await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80")}); }));
+app.post("/api/admin/feedback/:id/hide", requireCsrf, asyncRoute(async (req,res) => { const row=await one("SELECT status FROM feedback_comments WHERE id=?",[Number(req.params.id)]); const status=row?.status==="hidden"?"visible":"hidden"; await q("UPDATE feedback_comments SET status=? WHERE id=?",[status,Number(req.params.id)]); await audit(req,status==="hidden"?"hide":"restore","feedback",req.params.id,`Feedback ${status}`); await bump("feedback"); const rows=await q("SELECT fc.*,p.name product_name FROM feedback_comments fc LEFT JOIN products p ON p.id=fc.product_id ORDER BY fc.created_at DESC LIMIT 100"); res.json({feedback:rows.map((item)=>({id:Number(item.id),displayLabel:safeContact(item.author_email),message:item.message,status:item.status,productName:item.product_name||"General feedback",createdAt:item.created_at})),auditLogs:await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80")}); }));
+app.delete("/api/admin/feedback/:id", requireCsrf, asyncRoute(async (req,res) => { const id=Number(req.params.id); await q("DELETE FROM feedback_reactions WHERE feedback_id=?",[id]); await q("DELETE FROM feedback_comments WHERE parent_id=?",[id]); await q("DELETE FROM feedback_comments WHERE id=?",[id]); await audit(req,"delete","feedback",id,"Feedback deleted"); await bump("feedback"); const rows=await q("SELECT fc.*,p.name product_name FROM feedback_comments fc LEFT JOIN products p ON p.id=fc.product_id ORDER BY fc.created_at DESC LIMIT 100"); res.json({feedback:rows.map((item)=>({id:Number(item.id),displayLabel:safeContact(item.author_email),message:item.message,status:item.status,productName:item.product_name||"General feedback",createdAt:item.created_at})),auditLogs:await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80")}); }));
 app.get("/api/admin/audits", asyncRoute(async (_req,res) => res.json({auditLogs:await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80")})));
 app.get("/api/admin/settings", asyncRoute(async (_req,res) => res.json({settings:await business()})));
 app.put("/api/admin/settings", requireCsrf, asyncRoute(async (req,res) => { for(const key of ["business_name","phone","email","whatsapp","address","hours"]){ const value=String(req.body[key]||"").trim(); if(!value)return res.status(400).json({error:`${key} is required`}); await q("INSERT INTO business_settings(setting_key,setting_value) VALUES (?,?) ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value)",[key,key==="whatsapp"?value.replace(/\D/g,""):value]); } await audit(req,"update","settings","business","Business and map settings updated"); await bump("settings"); res.json({settings:await business()}); }));
@@ -294,7 +421,11 @@ app.put("/api/admin/settings", requireCsrf, asyncRoute(async (req,res) => { for(
 app.get("/api/live", asyncRoute(async (_req,res) => { res.set({"Content-Type":"text/event-stream","Cache-Control":"no-cache, no-transform","Connection":"keep-alive"}); res.flushHeaders?.(); let versions=Object.fromEntries((await q("SELECT topic,version FROM sync_state")).map((row)=>[row.topic,Number(row.version)])); res.write("retry: 2000\nevent: ready\ndata: connected\n\n"); for(let tick=0;tick<25;tick+=1){ await new Promise((resolve)=>setTimeout(resolve,1000)); const rows=await q("SELECT topic,version FROM sync_state"); for(const row of rows){ const version=Number(row.version); if(version!==versions[row.topic]){ versions[row.topic]=version; res.write(`event: sync\ndata: ${row.topic}\n\n`); } } res.write(": heartbeat\n\n"); } res.end(); }));
 
 app.use((req,res) => res.status(404).send(`<h1>Page not found</h1><p><a href="/">Return home</a></p>`));
-app.use((error, _req, res, _next) => { console.error(error); res.status(500).json({ error: IS_PRODUCTION ? "Server error" : error.message }); });
+app.use((error, _req, res, _next) => {
+  if (!error?.isPublic) console.error(error);
+  const status = Number(error?.statusCode) || 500;
+  res.status(status).json({ error: error?.isPublic || !IS_PRODUCTION ? error.message : "Server error" });
+});
 
 if (require.main === module) {
   const port = Number(process.env.PORT || 3000);
@@ -302,4 +433,4 @@ if (require.main === module) {
 }
 
 module.exports = app;
-module.exports._test = { escapeHtml, safeEmail, signed, validSigned, poolOptions };
+module.exports._test = { escapeHtml, safeEmail, safeContact, normalizeEmail, normalizePhone, publicIdentity, signed, validSigned, poolOptions };
