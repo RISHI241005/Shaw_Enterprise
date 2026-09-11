@@ -26,17 +26,14 @@ public class AuthService {
     private final String envUser;
     private final String envPassword;
     private final boolean registrationEnabled;
-    private final boolean exposeOtp;
     private final String otpSecret;
-    private final OtpDeliveryService delivery;
 
-    public AuthService(JdbcTemplate jdbc, OtpDeliveryService delivery,
+    public AuthService(JdbcTemplate jdbc,
                        @Value("${app.admin.username}") String envUser,
                        @Value("${app.admin.password}") String envPassword,
                        @Value("${app.admin.registration-enabled:false}") boolean registrationEnabled,
-                       @Value("${app.otp.expose-in-response:false}") boolean exposeOtp,
                        @Value("${app.otp.secret}") String otpSecret) {
-        this.jdbc = jdbc; this.delivery = delivery; this.envUser = envUser; this.envPassword = envPassword; this.registrationEnabled = registrationEnabled; this.exposeOtp = exposeOtp; this.otpSecret = otpSecret;
+        this.jdbc = jdbc; this.envUser = envUser; this.envPassword = envPassword; this.registrationEnabled = registrationEnabled; this.otpSecret = otpSecret;
     }
 
     public String authenticate(String identifier, String password) {
@@ -111,8 +108,7 @@ public class AuthService {
         var code = String.valueOf(ThreadLocalRandom.current().nextInt(100000, 1_000_000));
         jdbc.update("INSERT INTO admin_auth_codes(account_id,destination,channel,purpose,code_hash,expires_at,created_at) VALUES (?,?,?,?,?,?,?)",
             accountId, destination, channel, purpose, hash(code), Timestamp.valueOf(LocalDateTime.now().plusMinutes(10)), Timestamp.valueOf(LocalDateTime.now()));
-        delivery.deliver(destination, channel, code);
-        if (exposeOtp) result.put(responseKey, code);
+        result.put(responseKey, code);
     }
 
     private boolean consume(long accountId, String destination, String channel, String purpose, String code) {

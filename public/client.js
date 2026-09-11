@@ -145,7 +145,10 @@ async function requestOtp(root) {
   const note = qs(".form-note", root) || qs("#otpNote");
   if (note) {
     note.classList.remove("error");
-    note.textContent = result.devOtp ? `Local test code: ${result.devOtp}` : result.message;
+    note.classList.toggle("otp-preview", Boolean(result.devOtp));
+    note.innerHTML = result.devOtp
+      ? `${channel === "phone" ? "Phone" : "Email"} dummy OTP: <strong>${escapeHtml(result.devOtp)}</strong> <span>(valid for 10 minutes)</span>`
+      : escapeHtml(result.message);
   }
 }
 
@@ -175,7 +178,7 @@ function updateVerificationForm(select) {
   qs("input[name='otp']", root).value = "";
   const note = qs(".form-note", root);
   if (note) {
-    note.classList.remove("error");
+    note.classList.remove("error", "otp-preview");
     note.textContent = phone ? "We will text a one-time code. Include your country code." : "We will email a one-time verification code.";
   }
 }
@@ -833,7 +836,7 @@ function showAuthView(view) {
 function authStatus(message) { const node = qs("#authStatus"); if (node) node.textContent = message || ""; }
 function devCodeMessage(result) {
   const values = [["email", result.devEmailCode], ["phone", result.devPhoneCode], ["reset", result.devCode]].filter(([, value]) => value);
-  return values.length ? ` Development codes — ${values.map(([label, value]) => `${label}: ${value}`).join(" · ")}` : "";
+  return values.length ? ` Dummy OTPs — ${values.map(([label, value]) => `${label}: ${value}`).join(" · ")}` : "";
 }
 
 document.addEventListener("click", async (event) => {

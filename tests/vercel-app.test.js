@@ -38,3 +38,7 @@ test("publishes a masked identity without exposing its destination", () => {
     verified: true
   });
 });
+
+test("generates a six-digit dummy OTP", () => {
+  assert.match(helpers.generateDummyOtp(), /^\d{6}$/);
+});

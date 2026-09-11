@@ -14,7 +14,6 @@ const ADMIN_USER = process.env.ADMIN_USER || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "change-this-admin-password";
 const SESSION_SECRET = process.env.SESSION_SECRET || process.env.OTP_SECRET || "local-session-secret-change-me";
 const OTP_SECRET = process.env.OTP_SECRET || SESSION_SECRET;
-const DEV_EXPOSE_OTP = String(process.env.DEV_EXPOSE_OTP ?? "true") === "true";
 const rateLimits = new Map();
 let schemaPromise;
 
@@ -171,14 +170,6 @@ function safeContact(value = "") {
 }
 function otpHash(code) { return crypto.createHmac("sha256", OTP_SECRET).update(code).digest("hex"); }
 function asyncRoute(handler) { return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next); }
-class PublicError extends Error {
-  constructor(statusCode, message) {
-    super(message);
-    this.name = "PublicError";
-    this.statusCode = statusCode;
-    this.isPublic = true;
-  }
-}
 
 function publicIdentity(identity) {
   if (!identity) return null;
@@ -230,7 +221,7 @@ function productCard(item) {
 }
 function layout(title, content, req, info) {
   const nav = [["/", "Home"], ["/products", "Products"], ["/feedback", "Feedback"], ["/contact", "Contact"], [isAdmin(req) ? "/admin" : "/login", "Admin"]];
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} | Shaw Enterprise</title><meta name="csrf-token" content="${escapeHtml(req.csrfToken)}"><link rel="stylesheet" href="/styles.css"><script defer src="/client.js"></script></head><body><div class="launch-screen" aria-hidden="true"><div class="launch-mark">SE</div><p>STOCK IN MOTION</p><i></i></div><div class="page-atmosphere" aria-hidden="true"></div><header class="site-header"><a class="brand" href="/"><img src="/logo.svg" alt="Shaw Enterprise"></a><button class="nav-toggle" type="button">Menu</button><nav class="site-nav">${nav.map(([url, label]) => `<a href="${url}">${label}</a>`).join("")}</nav></header><main>${content}</main><footer class="site-footer"><div><strong>${escapeHtml(info.business_name)}</strong><span>Wholesale and retail disposable products.</span></div><div>${escapeHtml(info.phone)} | ${escapeHtml(info.email)}</div></footer></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} | Shaw Enterprise</title><meta name="csrf-token" content="${escapeHtml(req.csrfToken)}"><link rel="stylesheet" href="/styles.css?v=20260911"><script defer src="/client.js?v=20260911"></script></head><body><div class="launch-screen" aria-hidden="true"><div class="launch-mark">SE</div><p>STOCK IN MOTION</p><i></i></div><div class="page-atmosphere" aria-hidden="true"></div><header class="site-header"><a class="brand" href="/"><img src="/logo.svg" alt="Shaw Enterprise"></a><button class="nav-toggle" type="button">Menu</button><nav class="site-nav">${nav.map(([url, label]) => `<a href="${url}">${label}</a>`).join("")}</nav></header><main>${content}</main><footer class="site-footer"><div><strong>${escapeHtml(info.business_name)}</strong><span>Wholesale and retail disposable products.</span></div><div>${escapeHtml(info.phone)} | ${escapeHtml(info.email)}</div></footer></body></html>`;
 }
 
 app.disable("x-powered-by");
@@ -300,63 +291,12 @@ app.get("/api/products", asyncRoute(async (_req, res) => res.json({ products: aw
 app.get("/api/products/:id", asyncRoute(async (req, res) => { const item = await product(req.params.id); if (!item) return res.status(404).json({ error: "Product not found" }); res.json({ product: item, reviews: await feedbackThreads(req.visitorId, { productId: item.id, sort: "top" }) }); }));
 app.post("/api/inquiries", requireCsrf, asyncRoute(async (req, res) => { if (!rateLimit(req, "inquiry", 8, 600000)) return res.status(429).json({ error: "Too many enquiries" }); const { name, email, phone, message } = req.body; if (![name,email,phone,message].every((value) => String(value || "").trim())) return res.status(400).json({ error: "All enquiry fields are required" }); const result = await q("INSERT INTO inquiries(name,email,phone,message,status,created_at) VALUES (?,?,?,?, 'new',?)", [String(name).trim(),String(email).trim(),String(phone).trim(),String(message).trim(),now()]); await bump("inquiries"); res.status(201).json({ inquiry: { id: result.insertId, name: String(name).trim() }, message: "Enquiry saved" }); }));
 
-async function deliverEmailOtp(email, code) {
-  if (!process.env.RESEND_API_KEY || !process.env.EMAIL_FROM) {
-    if (DEV_EXPOSE_OTP && !IS_PRODUCTION) return { devOtp: code };
-    throw new PublicError(503, "Email verification is temporarily unavailable. Choose phone verification or try again later.");
-  }
-  try {
-    const response = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ from: process.env.EMAIL_FROM, to: [email], subject: "Your Shaw Enterprise verification code", text: `Your verification code is ${code}. It expires in 10 minutes.` }),
-      signal: AbortSignal.timeout(12000)
-    });
-    if (!response.ok) throw new PublicError(502, "The verification email could not be delivered. Check the address or choose phone verification.");
-    return {};
-  } catch (error) {
-    if (error instanceof PublicError) throw error;
-    throw new PublicError(502, "The email service is unavailable right now. Choose phone verification or try again later.");
-  }
-}
+function generateDummyOtp() { return String(crypto.randomInt(100000, 1000000)); }
 
-function twilioCredentials() {
-  const accountSid = process.env.TWILIO_ACCOUNT_SID;
-  const authToken = process.env.TWILIO_AUTH_TOKEN;
-  const serviceSid = process.env.TWILIO_VERIFY_SERVICE_SID;
-  if (!accountSid || !authToken || !serviceSid) {
-    throw new PublicError(503, "Phone verification is being set up. Choose email verification or try again later.");
-  }
-  return { accountSid, authToken, serviceSid };
-}
-
-async function twilioVerifyRequest(pathname, values) {
-  const { accountSid, authToken, serviceSid } = twilioCredentials();
-  try {
-    return await fetch(`https://verify.twilio.com/v2/Services/${encodeURIComponent(serviceSid)}/${pathname}`, {
-      method: "POST",
-      headers: { Authorization: `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`, "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams(values),
-      signal: AbortSignal.timeout(12000)
-    });
-  } catch (_error) {
-    throw new PublicError(502, "The SMS service is unavailable right now. Choose email verification or try again later.");
-  }
-}
-
-async function deliverPhoneOtp(phone) {
-  const response = await twilioVerifyRequest("Verifications", { To: phone, Channel: "sms" });
-  if (response.status === 429) throw new PublicError(429, "Too many SMS attempts. Wait a few minutes and try again.");
-  if (!response.ok) throw new PublicError(502, "The verification text could not be delivered. Check the phone number and country code.");
-}
-
-async function checkPhoneOtp(phone, code) {
-  const response = await twilioVerifyRequest("VerificationCheck", { To: phone, Code: code });
-  if ([400, 404].includes(response.status)) return false;
-  if (response.status === 429) throw new PublicError(429, "Too many verification attempts. Wait a few minutes and try again.");
-  if (!response.ok) throw new PublicError(502, "The SMS verification service is unavailable right now.");
-  const result = await response.json();
-  return result.status === "approved";
+async function issueDummyOtp(visitorId, destination) {
+  const code = generateDummyOtp();
+  await q("INSERT INTO feedback_identity_otps(visitor_id,email,otp_hash,expires_at,created_at) VALUES (?,?,?,?,?)", [visitorId,destination,otpHash(code),new Date(Date.now()+600000),now()]);
+  return code;
 }
 
 async function saveVerifiedIdentity(visitorId, destination, channel) {
@@ -370,15 +310,13 @@ app.post("/api/feedback/request-otp", requireCsrf, asyncRoute(async (req, res) =
   if (channel === "phone") {
     const phone = normalizePhone(req.body.phone || req.body.destination);
     if (!phone) return res.status(400).json({ error: "Enter a valid phone number with country code, for example +91 98765 43210." });
-    await deliverPhoneOtp(phone);
-    return res.json({ message: `Verification code sent by SMS to ${safeContact(phone)}.` });
+    const code = await issueDummyOtp(req.visitorId, phone);
+    return res.json({ message: `Dummy phone OTP generated for ${safeContact(phone)}.`, devOtp: code });
   }
   const email = normalizeEmail(req.body.email || req.body.destination);
   if (!email) return res.status(400).json({ error: "Enter a valid email address." });
-  const code = String(crypto.randomInt(100000, 1000000));
-  const delivery = await deliverEmailOtp(email, code);
-  await q("INSERT INTO feedback_identity_otps(visitor_id,email,otp_hash,expires_at,created_at) VALUES (?,?,?,?,?)", [req.visitorId,email,otpHash(code),new Date(Date.now()+600000),now()]);
-  return res.json({ message: `Verification code sent to ${safeContact(email)}.`, ...delivery });
+  const code = await issueDummyOtp(req.visitorId, email);
+  return res.json({ message: `Dummy email OTP generated for ${safeContact(email)}.`, devOtp: code });
 }));
 
 app.post("/api/feedback/verify-otp", requireCsrf, asyncRoute(async (req, res) => {
@@ -388,7 +326,9 @@ app.post("/api/feedback/verify-otp", requireCsrf, asyncRoute(async (req, res) =>
   if (channel === "phone") {
     const phone = normalizePhone(req.body.phone || req.body.destination);
     if (!phone) return res.status(400).json({ error: "Enter a valid phone number with country code." });
-    if (!await checkPhoneOtp(phone, code)) return res.status(400).json({ error: "Invalid or expired verification code." });
+    const row = await one("SELECT * FROM feedback_identity_otps WHERE visitor_id=? AND email=? AND used_at IS NULL ORDER BY id DESC LIMIT 1", [req.visitorId,phone]);
+    if (!row || new Date(row.expires_at) < now() || row.otp_hash !== otpHash(code)) return res.status(400).json({ error: "Invalid or expired verification code." });
+    await q("UPDATE feedback_identity_otps SET used_at=? WHERE id=?", [now(),row.id]);
     return res.json({ identity: await saveVerifiedIdentity(req.visitorId, phone, "phone") });
   }
   const email = normalizeEmail(req.body.email || req.body.destination);
@@ -433,4 +373,4 @@ if (require.main === module) {
 }
 
 module.exports = app;
-module.exports._test = { escapeHtml, safeEmail, safeContact, normalizeEmail, normalizePhone, publicIdentity, signed, validSigned, poolOptions };
+module.exports._test = { escapeHtml, safeEmail, safeContact, normalizeEmail, normalizePhone, publicIdentity, signed, validSigned, poolOptions, generateDummyOtp };

@@ -62,10 +62,16 @@ public class ApiController {
     }
 
     @PostMapping("/api/feedback/request-otp") Map<String, Object> requestFeedbackOtp(HttpServletRequest request, @RequestBody Map<String, Object> body) {
-        guard.csrf(request); guard.limit(request, "feedback-otp", 5, 600); return feedback.requestOtp(sessions.visitorId(request), text(body, "email"));
+        guard.csrf(request); guard.limit(request, "feedback-otp", 5, 600);
+        var channel = "phone".equals(text(body, "channel")) || (!body.containsKey("email") && body.containsKey("phone")) ? "phone" : "email";
+        var destination = "phone".equals(channel) ? text(body, "phone") : text(body, "email");
+        return feedback.requestOtp(sessions.visitorId(request), channel, destination);
     }
     @PostMapping("/api/feedback/verify-otp") Map<String, Object> verifyFeedbackOtp(HttpServletRequest request, @RequestBody Map<String, Object> body) {
-        guard.csrf(request); return Map.of("identity", feedback.verifyOtp(sessions.visitorId(request), text(body, "email"), text(body, "otp")));
+        guard.csrf(request);
+        var channel = "phone".equals(text(body, "channel")) || (!body.containsKey("email") && body.containsKey("phone")) ? "phone" : "email";
+        var destination = "phone".equals(channel) ? text(body, "phone") : text(body, "email");
+        return Map.of("identity", feedback.verifyOtp(sessions.visitorId(request), channel, destination, text(body, "otp")));
     }
     @GetMapping("/api/feedback") Map<String, Object> feedback(HttpServletRequest request, @RequestParam(defaultValue = "top") String sort) {
         var visitor = sessions.visitorId(request); return Map.of("identity", nullable(feedback.identity(visitor)), "threads", feedback.threads(visitor, sort, null, false));

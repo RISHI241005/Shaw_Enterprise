@@ -26,40 +26,35 @@ import java.util.concurrent.ThreadLocalRandom;
 public class FeedbackService {
     private final JdbcTemplate jdbc;
     private final LiveUpdateService live;
-    private final OtpDeliveryService delivery;
     private final String otpSecret;
-    private final boolean exposeOtp;
 
-    public FeedbackService(JdbcTemplate jdbc, LiveUpdateService live, OtpDeliveryService delivery,
-                           @Value("${app.otp.secret}") String otpSecret,
-                           @Value("${app.otp.expose-in-response:false}") boolean exposeOtp) {
-        this.jdbc = jdbc; this.live = live; this.delivery = delivery; this.otpSecret = otpSecret; this.exposeOtp = exposeOtp;
+    public FeedbackService(JdbcTemplate jdbc, LiveUpdateService live,
+                           @Value("${app.otp.secret}") String otpSecret) {
+        this.jdbc = jdbc; this.live = live; this.otpSecret = otpSecret;
     }
 
     public Map<String, Object> identity(String visitorId) {
         var rows = jdbc.queryForList("SELECT email,verified FROM feedback_identities WHERE visitor_id=?", visitorId);
         if (rows.isEmpty()) return null;
         var row = rows.getFirst();
-        return Map.of("email", safeEmail(String.valueOf(row.get("email"))), "verified", truthy(row.get("verified")));
+        return publicIdentity(String.valueOf(row.get("email")), truthy(row.get("verified")));
     }
 
     @Transactional
-    public Map<String, Object> requestOtp(String visitorId, String email) {
-        var normalized = email == null ? "" : email.trim().toLowerCase();
-        if (!normalized.matches("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$")) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Valid email is required");
+    public Map<String, Object> requestOtp(String visitorId, String channel, String destination) {
+        var normalized = normalizeDestination(channel, destination);
         var otp = String.valueOf(ThreadLocalRandom.current().nextInt(100000, 1_000_000));
         jdbc.update("INSERT INTO feedback_identity_otps(visitor_id,email,otp_hash,expires_at,created_at) VALUES (?,?,?,?,?)",
             visitorId, normalized, hash(otp), Timestamp.valueOf(LocalDateTime.now().plusMinutes(10)), Timestamp.valueOf(LocalDateTime.now()));
-        delivery.deliver(normalized, "email", otp);
         var result = new LinkedHashMap<String, Object>();
-        result.put("message", exposeOtp ? "Development OTP generated" : "OTP sent");
-        if (exposeOtp) result.put("devOtp", otp);
+        result.put("message", "Dummy " + ("phone".equals(channel) ? "phone" : "email") + " OTP generated");
+        result.put("devOtp", otp);
         return result;
     }
 
     @Transactional
-    public Map<String, Object> verifyOtp(String visitorId, String email, String otp) {
-        var normalized = email == null ? "" : email.trim().toLowerCase();
+    public Map<String, Object> verifyOtp(String visitorId, String channel, String destination, String otp) {
+        var normalized = normalizeDestination(channel, destination);
         var rows = jdbc.queryForList("SELECT id,otp_hash,expires_at FROM feedback_identity_otps WHERE visitor_id=? AND email=? AND used_at IS NULL ORDER BY id DESC LIMIT 1", visitorId, normalized);
         if (rows.isEmpty()) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid or expired OTP");
         var row = rows.getFirst();
@@ -71,7 +66,7 @@ public class FeedbackService {
             INSERT INTO feedback_identities(visitor_id,email,verified,created_at,updated_at) VALUES (?,?,TRUE,?,?)
             ON DUPLICATE KEY UPDATE email=VALUES(email),verified=TRUE,updated_at=VALUES(updated_at)
             """, visitorId, normalized, Timestamp.valueOf(LocalDateTime.now()), Timestamp.valueOf(LocalDateTime.now()));
-        return Map.of("email", safeEmail(normalized), "verified", true);
+        return publicIdentity(normalized, true);
     }
 
     public List<FeedbackDto> threads(String visitorId, String sort, Long productId, boolean includeHidden) {
@@ -122,7 +117,7 @@ public class FeedbackService {
     @Transactional
     public void post(String visitorId, String message, Long parentId, Long productId) {
         var identity = jdbc.queryForList("SELECT email FROM feedback_identities WHERE visitor_id=? AND verified=TRUE", visitorId);
-        if (identity.isEmpty()) throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Please verify your email before posting");
+        if (identity.isEmpty()) throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Please verify your email or phone before posting");
         var clean = message == null ? "" : message.trim();
         if (clean.length() < 3 || clean.length() > 5000) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Feedback must be between 3 and 5000 characters");
         if (parentId != null && jdbc.queryForObject("SELECT COUNT(*) FROM feedback_comments WHERE id=?", Integer.class, parentId) == 0)
@@ -160,6 +155,24 @@ public class FeedbackService {
 
     private Object[] combine(Object first, Object[] rest) { var result = new Object[rest.length + 1]; result[0] = first; System.arraycopy(rest, 0, result, 1, rest.length); return result; }
     private String safeEmail(String email) { var at = email.indexOf('@'); if (at < 1) return "Verified customer"; return email.substring(0, Math.min(2, at)) + "***" + email.substring(at); }
+    private String safePhone(String phone) { return phone.length() > 7 ? phone.substring(0, Math.min(3, phone.length() - 4)) + "*****" + phone.substring(phone.length() - 4) : "Verified customer"; }
+    private Map<String, Object> publicIdentity(String destination, boolean verified) {
+        var channel = destination.contains("@") ? "email" : "phone";
+        var contact = "phone".equals(channel) ? safePhone(destination) : safeEmail(destination);
+        return Map.of("channel", channel, "contact", contact, "email", contact, "verified", verified);
+    }
+    private String normalizeDestination(String channel, String destination) {
+        var value = destination == null ? "" : destination.trim();
+        if ("phone".equals(channel)) {
+            var phone = value.replaceAll("[\\s().-]", "");
+            if (phone.matches("^\\d{10}$")) phone = "+91" + phone;
+            if (!phone.matches("^\\+[1-9]\\d{7,14}$")) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Enter a valid phone number with country code");
+            return phone;
+        }
+        var email = value.toLowerCase();
+        if (!email.matches("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$") || email.length() > 180) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Enter a valid email address");
+        return email;
+    }
     private boolean truthy(Object value) { return Boolean.TRUE.equals(value) || value instanceof Number number && number.intValue() == 1; }
     private LocalDateTime dateTime(Object value) { if (value instanceof LocalDateTime date) return date; if (value instanceof Timestamp stamp) return stamp.toLocalDateTime(); throw new IllegalArgumentException("Unsupported database date value"); }
     private String hash(String value) { try { return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest((value + ":" + otpSecret).getBytes(StandardCharsets.UTF_8))); } catch (NoSuchAlgorithmException impossible) { throw new IllegalStateException(impossible); } }
