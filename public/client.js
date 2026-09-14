@@ -10,9 +10,15 @@ const state = {
   productPanelReviews: [],
   adminProducts: [],
   adminInquiries: [],
+  adminOrders: [],
   productFormImages: [],
-  activeCategory: "all"
+  activeCategory: "all",
+  cart: []
 };
+
+const DELIVERY_FEE = 99;
+const FREE_DELIVERY_MINIMUM = 1000;
+const CART_KEY = "shaw_cart_v1";
 
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 const rootStyle = document.documentElement.style;
@@ -79,6 +85,103 @@ function fetchJson(url, options = {}) {
     if (!response.ok) throw new Error(data.error || "Request failed");
     return data;
   });
+}
+
+function formatMoney(value) {
+  return new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 2 }).format(Number(value) || 0);
+}
+
+function loadCart() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(CART_KEY) || "[]");
+    state.cart = Array.isArray(stored) ? stored.filter((item) => Number.isSafeInteger(Number(item.id)) && Number(item.quantity) > 0).map((item) => ({ ...item, id: Number(item.id), unitPrice: Number(item.unitPrice), stock: Math.max(0, Number(item.stock) || 0), quantity: Math.min(99, Math.max(1, Number(item.quantity) || 1)) })) : [];
+  } catch { state.cart = []; }
+}
+
+function saveCart() {
+  localStorage.setItem(CART_KEY, JSON.stringify(state.cart));
+  renderCart();
+}
+
+function cartSubtotal() { return state.cart.reduce((sum, item) => sum + Number(item.unitPrice) * Number(item.quantity), 0); }
+
+function cartItemHtml(item) {
+  return `<article class="cart-item">
+    <img src="${escapeHtml(item.image || "/images/product.svg")}" alt="">
+    <div><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.priceLabel || formatMoney(item.unitPrice))}</small>
+      <div class="quantity-control"><button class="cart-decrease" data-product-id="${item.id}" type="button" aria-label="Decrease quantity">−</button><input class="cart-quantity" data-product-id="${item.id}" type="number" min="1" max="${Math.min(99, Math.max(1,item.stock || 99))}" value="${item.quantity}" aria-label="Quantity for ${escapeHtml(item.name)}"><button class="cart-increase" data-product-id="${item.id}" type="button" aria-label="Increase quantity">+</button></div>
+    </div><div class="cart-line-end"><strong>${formatMoney(item.unitPrice * item.quantity)}</strong><button class="text-button cart-remove" data-product-id="${item.id}" type="button">Remove</button></div>
+  </article>`;
+}
+
+function renderCart() {
+  const count = state.cart.reduce((sum, item) => sum + item.quantity, 0);
+  qsa(".cart-count").forEach((node) => { node.textContent = count; });
+  const items = qs("#cartItems");
+  const footer = qs("#cartFooter");
+  if (items) items.innerHTML = state.cart.length ? state.cart.map(cartItemHtml).join("") : `<div class="cart-empty"><strong>Your cart is empty</strong><p>Browse the catalog and add the packs you need.</p><a class="button primary close-cart" href="/products">Shop products</a></div>`;
+  if (footer) footer.innerHTML = state.cart.length ? `<div class="cart-total"><span>Subtotal</span><strong>${formatMoney(cartSubtotal())}</strong></div><p>Delivery is calculated at checkout. Free delivery above ${formatMoney(FREE_DELIVERY_MINIMUM)}.</p><a class="button primary" href="/checkout">Proceed to checkout</a>` : "";
+  renderCheckoutSummary();
+}
+
+function productFromCard(card) {
+  return { id: Number(card.dataset.productId), name: card.dataset.productName, unitPrice: Number(card.dataset.price), priceLabel: card.dataset.priceLabel, image: card.dataset.image, stock: Number(card.dataset.stock) };
+}
+
+function addToCart(item, quantity = 1) {
+  if (!item || !(item.unitPrice > 0) || !(item.stock > 0)) throw new Error("This product is not currently available to order.");
+  const existing = state.cart.find((line) => line.id === Number(item.id));
+  if (existing) existing.quantity = Math.min(99, item.stock, existing.quantity + quantity);
+  else state.cart.push({ ...item, id: Number(item.id), quantity: Math.min(quantity, item.stock) });
+  saveCart();
+  openCart();
+}
+
+function updateCartQuantity(id, quantity) {
+  const item = state.cart.find((line) => line.id === Number(id));
+  if (!item) return;
+  item.quantity = Math.min(99, item.stock || 99, Math.max(1, Number(quantity) || 1));
+  saveCart();
+}
+
+function openCart() { qs("#cartDrawer")?.setAttribute("aria-hidden", "false"); document.body.classList.add("cart-open"); }
+function closeCart() { qs("#cartDrawer")?.setAttribute("aria-hidden", "true"); document.body.classList.remove("cart-open"); }
+
+function selectedFulfilment() { return qs("input[name='fulfillmentMethod']:checked")?.value || "delivery"; }
+
+function renderCheckoutSummary() {
+  const items = qs("#checkoutItems"), totals = qs("#checkoutTotals"), submit = qs(".checkout-submit");
+  if (!items || !totals) return;
+  const subtotal = cartSubtotal();
+  const deliveryFee = selectedFulfilment() === "delivery" && subtotal < FREE_DELIVERY_MINIMUM ? DELIVERY_FEE : 0;
+  items.innerHTML = state.cart.length ? state.cart.map((item) => `<div class="checkout-line"><span>${escapeHtml(item.name)} <small>× ${item.quantity}</small></span><strong>${formatMoney(item.unitPrice * item.quantity)}</strong></div>`).join("") : `<div class="cart-empty"><strong>Your cart is empty.</strong><a href="/products">Return to products</a></div>`;
+  totals.innerHTML = state.cart.length ? `<div><span>Subtotal</span><strong>${formatMoney(subtotal)}</strong></div><div><span>Delivery</span><strong>${deliveryFee ? formatMoney(deliveryFee) : "Free"}</strong></div><div class="checkout-grand-total"><span>Total</span><strong>${formatMoney(subtotal + deliveryFee)}</strong></div>` : "";
+  if (submit) submit.disabled = !state.cart.length;
+}
+
+function setFulfilment(method) {
+  const pickup = method === "pickup";
+  qsa(".address-fields input").forEach((input) => { input.required = !pickup; input.disabled = pickup; });
+  qs(".address-fields")?.classList.toggle("disabled", pickup);
+  const title = qs("#paymentMethodTitle"), copy = qs("#paymentMethodCopy");
+  if (title) title.textContent = pickup ? "Pay on pickup" : "Cash on delivery";
+  if (copy) copy.textContent = pickup ? "Pay when you collect the order from Shaw Enterprise." : "Pay when your order reaches you. No card details are collected on this website.";
+  renderCheckoutSummary();
+}
+
+const orderStatusLabels = { placed: "Order placed", confirmed: "Confirmed", packing: "Packing", ready: "Ready", out_for_delivery: "Out for delivery", delivered: "Delivered", cancelled: "Cancelled" };
+
+function orderHtml(order) {
+  const address = order.fulfillmentMethod === "pickup" ? "Pickup from Shaw Enterprise" : [order.addressLine,order.city,order.state,order.postalCode].filter(Boolean).join(", ");
+  const steps = ["placed","confirmed","packing","ready",...(order.fulfillmentMethod === "delivery" ? ["out_for_delivery"] : []),"delivered"];
+  const progress = order.status === "cancelled" ? -1 : steps.indexOf(order.status);
+  return `<article class="order-card status-${escapeHtml(order.status)}" data-order-number="${escapeHtml(order.orderNumber)}"><div class="order-card-head"><div><span class="order-number">${escapeHtml(order.orderNumber)}</span><h3>${escapeHtml(orderStatusLabels[order.status] || order.status)}</h3></div><strong>${formatMoney(order.total)}</strong></div><div class="order-meta"><span>${new Date(order.createdAt).toLocaleString("en-IN")}</span><span>${escapeHtml(order.fulfillmentMethod === "pickup" ? "Store pickup" : "Delivery")}</span><span>${escapeHtml(order.paymentMethod === "pay_on_pickup" ? "Pay on pickup" : "Cash on delivery")}</span></div>${order.status === "cancelled" ? '<p class="cancelled-note">This order was cancelled and its stock was returned.</p>' : `<div class="order-progress" style="--steps:${steps.length}" data-status="${escapeHtml(order.status)}">${steps.map((step,index) => `<span class="${index < progress ? "complete" : index === progress ? "current" : ""}">${escapeHtml(orderStatusLabels[step])}</span>`).join("")}</div>`}<div class="order-products">${(order.items || []).map((item) => `<div><span>${escapeHtml(item.productName)} <small>× ${item.quantity}</small></span><strong>${formatMoney(item.lineTotal)}</strong></div>`).join("")}</div><div class="order-delivery"><strong>${escapeHtml(order.customerName)}</strong><span>${escapeHtml(address)}</span></div></article>`;
+}
+
+async function refreshCustomerOrders() {
+  const root = qs("#customerOrders"); if (!root) return;
+  const result = await fetchJson("/api/orders");
+  root.innerHTML = result.orders.length ? result.orders.map(orderHtml).join("") : `<div class="empty-state"><strong>No orders from this device yet.</strong><p>Once you check out, your live order status will appear here.</p><a class="button primary" href="/products">Start shopping</a></div>`;
 }
 
 function avatarTone(label = "") {
@@ -445,7 +548,11 @@ function productPanelHtml(product, reviews) {
           <div><dt>Pack size</dt><dd>${escapeHtml(product.packSize)}</dd></div>
           <div><dt>Best for</dt><dd>${escapeHtml(product.audience)}</dd></div>
         </dl>
-        <a class="button primary" href="/contact">Ask for Quote</a>
+        <div class="panel-commerce">
+          <div><small>${product.inStock ? `${product.stockQuantity} packs available` : "Currently unavailable"}</small><strong>${formatMoney(product.unitPrice)} per listed pack</strong></div>
+          <button class="button primary add-panel-to-cart" data-product-id="${product.id}" type="button" ${product.inStock ? "" : "disabled"}>${product.inStock ? "Add to cart" : "Out of stock"}</button>
+        </div>
+        <a class="text-link" href="/contact">Need a custom bulk quote?</a>
       </div>
       <section class="panel-reviews">
         <h3>Product Reviews</h3>
@@ -515,7 +622,10 @@ function productFormData(form) {
     summary: form.elements.summary.value,
     details: form.elements.details.value,
     images: state.productFormImages,
-    featured: form.elements.featured.checked
+    featured: form.elements.featured.checked,
+    unitPrice: Number(form.elements.unitPrice.value),
+    stockQuantity: Number(form.elements.stockQuantity.value),
+    orderingEnabled: form.elements.orderingEnabled.checked
   };
 }
 
@@ -526,6 +636,8 @@ function fillProductForm(product) {
   form.elements.name.value = product.name;
   form.elements.category.value = product.category;
   form.elements.price.value = product.price;
+  form.elements.unitPrice.value = product.unitPrice;
+  form.elements.stockQuantity.value = product.stockQuantity;
   form.elements.productType.value = product.productType;
   form.elements.packSize.value = product.packSize;
   form.elements.audience.value = product.audience;
@@ -533,6 +645,7 @@ function fillProductForm(product) {
   form.elements.details.value = product.details;
   setProductFormImages(product.images || []);
   form.elements.featured.checked = product.featured;
+  form.elements.orderingEnabled.checked = product.orderingEnabled;
   form.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
@@ -543,10 +656,24 @@ function renderAdminProducts(products) {
   root.innerHTML = state.adminProducts.map((product) => `
     <article class="admin-row">
       <img src="${escapeHtml(product.images?.[0] || "/images/product.svg")}" alt="" />
-      <div><strong>${escapeHtml(product.name)}</strong><p>${escapeHtml(product.price)} | ${escapeHtml(product.category)}</p></div>
+      <div><strong>${escapeHtml(product.name)}</strong><p>${escapeHtml(product.price)} | ${escapeHtml(product.category)}</p><small>${product.orderingEnabled ? `${product.stockQuantity} packs available online` : "Online ordering disabled"}</small></div>
       <button class="button small ghost edit-product" data-product-id="${product.id}" type="button">Edit</button>
       <button class="button small danger delete-product" data-product-id="${product.id}" type="button">Delete</button>
     </article>`).join("") || "<p>No products found.</p>";
+}
+
+const adminOrderTransitions = {
+  placed: ["confirmed", "cancelled"], confirmed: ["packing", "cancelled"], packing: ["ready", "cancelled"],
+  ready: ["out_for_delivery", "delivered", "cancelled"], out_for_delivery: ["delivered", "cancelled"], delivered: [], cancelled: []
+};
+
+function renderAdminOrders(items) {
+  const root = qs("#adminOrders"); if (!root) return;
+  state.adminOrders = items || [];
+  root.innerHTML = state.adminOrders.length ? state.adminOrders.map((order) => {
+    const next = order.status === "ready" ? (order.fulfillmentMethod === "pickup" ? ["delivered","cancelled"] : ["out_for_delivery","cancelled"]) : (adminOrderTransitions[order.status] || []);
+    return `<article class="admin-order status-${escapeHtml(order.status)}"><div class="admin-order-head"><div><span class="order-number">${escapeHtml(order.orderNumber)}</span><h3>${escapeHtml(order.customerName)}</h3><small>${new Date(order.createdAt).toLocaleString("en-IN")} · ${escapeHtml(order.phone)} · ${escapeHtml(order.email)}</small></div><strong>${formatMoney(order.total)}</strong></div><div class="order-products">${order.items.map((item) => `<div><span>${escapeHtml(item.productName)} <small>× ${item.quantity}</small></span><strong>${formatMoney(item.lineTotal)}</strong></div>`).join("")}</div><div class="admin-order-foot"><div><strong>${escapeHtml(order.fulfillmentMethod === "pickup" ? "Store pickup" : "Delivery")}</strong><span>${escapeHtml(order.fulfillmentMethod === "pickup" ? "Customer will collect" : [order.addressLine,order.city,order.state,order.postalCode].filter(Boolean).join(", "))}</span>${order.notes ? `<small>Note: ${escapeHtml(order.notes)}</small>` : ""}</div><label>Status<select class="order-status" data-order-id="${order.id}" ${next.length ? "" : "disabled"}><option value="${escapeHtml(order.status)}">${escapeHtml(orderStatusLabels[order.status] || order.status)}</option>${next.map((status) => `<option value="${status}">${escapeHtml(orderStatusLabels[status] || status)}</option>`).join("")}</select></label></div></article>`;
+  }).join("") : `<p class="empty">No online orders yet.</p>`;
 }
 
 function renderAdminFeedback(items) {
@@ -593,6 +720,10 @@ function renderAuditLog(items) {
 }
 
 async function refreshAdmin() {
+  if (qs("#adminOrders")) {
+    const orders = await fetchJson("/api/admin/orders");
+    renderAdminOrders(orders.orders);
+  }
   if (qs("#auditLog")) {
     const audits = await fetchJson("/api/admin/audits");
     renderAuditLog(audits.auditLogs);
@@ -618,6 +749,24 @@ document.addEventListener("click", async (event) => {
   if (!target) return;
 
   try {
+    if (target.matches(".open-cart")) openCart();
+    if (target.matches(".close-cart")) closeCart();
+    if (target.matches(".add-to-cart")) {
+      const card = target.closest(".product-card");
+      if (card) addToCart(productFromCard(card));
+    }
+    if (target.matches(".add-panel-to-cart") && state.productPanelProduct) {
+      const product = state.productPanelProduct;
+      addToCart({ id: product.id, name: product.name, unitPrice: product.unitPrice, priceLabel: product.price, image: product.images?.[0], stock: product.stockQuantity });
+    }
+    if (target.matches(".cart-decrease, .cart-increase")) {
+      const item = state.cart.find((line) => line.id === Number(target.dataset.productId));
+      if (item) updateCartQuantity(item.id, item.quantity + (target.matches(".cart-increase") ? 1 : -1));
+    }
+    if (target.matches(".cart-remove")) {
+      state.cart = state.cart.filter((line) => line.id !== Number(target.dataset.productId));
+      saveCart();
+    }
     if (target.matches(".nav-toggle")) {
       qs(".site-nav")?.classList.toggle("open");
     }
@@ -731,6 +880,8 @@ document.addEventListener("click", async (event) => {
 
 document.addEventListener("change", (event) => {
   if (event.target.matches("select[name='verificationChannel']")) updateVerificationForm(event.target);
+  if (event.target.matches("input[name='fulfillmentMethod']")) setFulfilment(event.target.value);
+  if (event.target.matches(".cart-quantity")) updateCartQuantity(event.target.dataset.productId, event.target.value);
 });
 
 document.addEventListener("submit", async (event) => {
@@ -751,6 +902,29 @@ document.addEventListener("submit", async (event) => {
     if (form.matches(".contact-form")) {
       event.preventDefault();
       await submitInquiry(form);
+    }
+    if (form.matches("#checkoutForm")) {
+      event.preventDefault();
+      if (!state.cart.length) throw new Error("Your cart is empty.");
+      const payload = Object.fromEntries(new FormData(form));
+      payload.items = state.cart.map((item) => ({ productId: item.id, quantity: item.quantity }));
+      const submit = qs(".checkout-submit", form), note = qs(".checkout-status", form);
+      submit.disabled = true; submit.textContent = "Placing order…";
+      const result = await fetchJson("/api/orders", { method: "POST", body: JSON.stringify(payload) });
+      state.cart = []; saveCart();
+      qs(".checkout-shell").innerHTML = `<section class="order-success"><span class="success-mark">✓</span><p class="eyebrow">Order confirmed</p><h2>Thank you, ${escapeHtml(result.order.customerName)}.</h2><p>Your order number is <strong>${escapeHtml(result.order.orderNumber)}</strong>. Keep it with the phone number used at checkout.</p>${orderHtml(result.order)}<div><a class="button primary" href="/orders">Track my order</a><a class="button ghost" href="/products">Continue shopping</a></div></section>`;
+      if (note) note.textContent = "";
+    }
+    if (form.matches("#orderLookupForm")) {
+      event.preventDefault();
+      const note = qs(".lookup-status", form);
+      const result = await fetchJson("/api/orders/lookup", { method: "POST", body: JSON.stringify(Object.fromEntries(new FormData(form))) });
+      note.textContent = "Order found.";
+      const root = qs("#customerOrders");
+      const existing = qsa("[data-order-number]", root).find((card) => card.dataset.orderNumber === result.order.orderNumber);
+      if (existing) existing.scrollIntoView({ behavior: "smooth", block: "center" });
+      else if (qs(".empty-state, .empty", root)) root.innerHTML = orderHtml(result.order);
+      else root.insertAdjacentHTML("afterbegin", orderHtml(result.order));
     }
     if (form.matches("#productForm")) {
       event.preventDefault();
@@ -773,12 +947,25 @@ document.addEventListener("submit", async (event) => {
       if (result.settings?.mapSearchUrl) form.querySelector("a[target='_blank']")?.setAttribute("href", result.settings.mapSearchUrl);
     }
   } catch (error) {
-    alert(error.message);
+    if (form.matches("#checkoutForm")) {
+      const submit = qs(".checkout-submit", form), note = qs(".checkout-status", form);
+      if (submit) { submit.disabled = !state.cart.length; submit.textContent = "Place order"; }
+      if (note) { note.textContent = error.message; note.classList.add("error"); }
+    } else if (form.matches("#orderLookupForm")) {
+      const note = qs(".lookup-status", form); if (note) { note.textContent = error.message; note.classList.add("error"); }
+    } else alert(error.message);
   }
 });
 
 document.addEventListener("change", async (event) => {
   const input = event.target;
+  if (input.matches(".order-status")) {
+    try {
+      const result = await fetchJson(`/api/admin/orders/${input.dataset.orderId}/status`, { method: "POST", body: JSON.stringify({ status: input.value }) });
+      renderAdminOrders(result.orders); renderAuditLog(result.auditLogs);
+    } catch (error) { alert(error.message); await refreshAdmin(); }
+    return;
+  }
   if (input.matches(".inquiry-status")) {
     try {
       const result = await fetchJson(`/api/admin/inquiries/${input.dataset.inquiryId}/status`, {
@@ -890,6 +1077,7 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     closeCommandPalette();
     closeProductPanel();
+    closeCart();
   }
   if (event.key === "/" && qs("#productSearch") && document.activeElement === document.body) {
     event.preventDefault();
@@ -907,6 +1095,12 @@ if (shell) {
   refreshFeedback();
 }
 
+loadCart();
+renderCart();
+setFulfilment(selectedFulfilment());
+refreshCustomerOrders().catch(() => {
+  const root = qs("#customerOrders"); if (root) root.innerHTML = `<p class="empty">Orders could not be loaded right now.</p>`;
+});
 refreshAdmin();
 
 setProductFormImages([]);
@@ -937,12 +1131,13 @@ if ("EventSource" in window) {
     window.clearTimeout(liveTimer);
     liveTimer = window.setTimeout(async () => {
       const topic = event.data;
-      if (document.querySelector(".admin-shell")) {
-        await refreshAdmin().catch(() => {});
+       if (document.querySelector(".admin-shell")) {
+         await refreshAdmin().catch(() => {});
         if (topic === "settings" && document.querySelector("#businessSettingsForm")) window.location.reload();
         return;
       }
-      if (topic === "feedback" && document.querySelector("#feedbackList")) await refreshFeedback().catch(() => {});
+       if (topic === "orders" && document.querySelector("#customerOrders")) await refreshCustomerOrders().catch(() => {});
+       else if (topic === "feedback" && document.querySelector("#feedbackList")) await refreshFeedback().catch(() => {});
       else if (topic === "feedback" && state.productPanelProduct) await openProduct(state.productPanelProduct.id).catch(() => {});
       else if ((topic === "products" && (location.pathname === "/" || location.pathname === "/products")) || (topic === "settings" && location.pathname === "/contact")) window.location.reload();
     }, 250);

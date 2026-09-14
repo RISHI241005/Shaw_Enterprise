@@ -8,6 +8,7 @@ import com.shawenterprise.service.CatalogService;
 import com.shawenterprise.service.FeedbackService;
 import com.shawenterprise.service.InquiryService;
 import com.shawenterprise.service.LiveUpdateService;
+import com.shawenterprise.service.OrderService;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
@@ -34,14 +35,15 @@ public class ApiController {
     private final AuditService audits;
     private final BusinessService business;
     private final LiveUpdateService live;
+    private final OrderService orders;
     private final SessionContext sessions;
     private final RequestGuard guard;
     private final JdbcTemplate jdbc;
 
     public ApiController(CatalogService catalog, InquiryService inquiries, FeedbackService feedback, AuthService auth, AuditService audits,
-                         BusinessService business, LiveUpdateService live, SessionContext sessions, RequestGuard guard, JdbcTemplate jdbc) {
+                         BusinessService business, LiveUpdateService live, OrderService orders, SessionContext sessions, RequestGuard guard, JdbcTemplate jdbc) {
         this.catalog = catalog; this.inquiries = inquiries; this.feedback = feedback; this.auth = auth; this.audits = audits; this.business = business;
-        this.live = live; this.sessions = sessions; this.guard = guard; this.jdbc = jdbc;
+        this.live = live; this.orders = orders; this.sessions = sessions; this.guard = guard; this.jdbc = jdbc;
     }
 
     @GetMapping("/healthz") Map<String, Object> health() {
@@ -59,6 +61,17 @@ public class ApiController {
         guard.csrf(request); guard.limit(request, "inquiries", 8, 600);
         var item = inquiries.create(text(body, "name"), text(body, "email"), text(body, "phone"), text(body, "message"));
         return ResponseEntity.status(HttpStatus.CREATED).body(Map.of("inquiry", item, "message", "Enquiry saved"));
+    }
+
+    @PostMapping("/api/orders") ResponseEntity<Map<String, Object>> order(HttpServletRequest request, @RequestBody Map<String, Object> body) {
+        guard.csrf(request); guard.limit(request, "place-order", 10, 600);
+        var order = orders.create(sessions.visitorId(request), body);
+        return ResponseEntity.status(HttpStatus.CREATED).body(Map.of("order", order, "message", "Order " + order.orderNumber() + " has been placed."));
+    }
+    @GetMapping("/api/orders") Map<String, Object> customerOrders(HttpServletRequest request) { return Map.of("orders", orders.forVisitor(sessions.visitorId(request))); }
+    @PostMapping("/api/orders/lookup") Map<String, Object> orderLookup(HttpServletRequest request, @RequestBody Map<String, Object> body) {
+        guard.csrf(request); guard.limit(request, "order-lookup", 20, 600);
+        return Map.of("order", orders.lookup(text(body,"orderNumber"), text(body,"phone")));
     }
 
     @PostMapping("/api/feedback/request-otp") Map<String, Object> requestFeedbackOtp(HttpServletRequest request, @RequestBody Map<String, Object> body) {
@@ -99,6 +112,10 @@ public class ApiController {
     @PostMapping("/api/auth/reset-password") Map<String, Object> reset(HttpServletRequest request, @RequestBody Map<String, Object> body) { guard.csrf(request); auth.resetPassword(text(body,"email"),text(body,"code"),text(body,"password")); return Map.of("message","Password updated. You can now sign in."); }
 
     @GetMapping("/api/admin/products") Map<String, Object> adminProducts(HttpServletRequest request) { admin(request); return Map.of("products", catalog.all()); }
+    @GetMapping("/api/admin/orders") Map<String, Object> adminOrders(HttpServletRequest request) { admin(request); return Map.of("orders",orders.all(),"auditLogs",audits.latest()); }
+    @PostMapping("/api/admin/orders/{id}/status") Map<String, Object> orderStatus(HttpServletRequest request,@PathVariable long id,@RequestBody Map<String,Object> body) {
+        adminWrite(request); var status=text(body,"status"); var result=orders.updateStatus(id,status); audits.log(request,"status","order",id,"Order marked "+status); return Map.of("orders",result,"auditLogs",audits.latest());
+    }
     @PostMapping("/api/admin/products") ResponseEntity<Map<String, Object>> createProduct(HttpServletRequest request, @Valid @RequestBody ProductRequest body) {
         adminWrite(request); var product = catalog.create(body); audits.log(request,"create","product",product.id(),product.name()); return ResponseEntity.status(HttpStatus.CREATED).body(Map.of("products",catalog.all(),"auditLogs",audits.latest()));
     }

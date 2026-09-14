@@ -42,3 +42,24 @@ test("publishes a masked identity without exposing its destination", () => {
 test("generates a six-digit dummy OTP", () => {
   assert.match(helpers.generateDummyOtp(), /^\d{6}$/);
 });
+
+test("extracts a structured order price from existing catalog labels", () => {
+  assert.equal(helpers.parsePriceAmount("Rs. 1,250 / 500 pcs"), 1250);
+  assert.equal(helpers.parsePriceAmount("₹95.50 per pack"), 95.5);
+  assert.equal(helpers.parsePriceAmount("Ask for quote"), null);
+});
+
+test("normalizes duplicate cart lines without trusting client totals", () => {
+  assert.deepEqual(helpers.normalizeOrderItems([
+    { productId: 8, quantity: 2 },
+    { productId: 8, quantity: 3 },
+    { productId: 12, quantity: 1 }
+  ]), [{ productId: 8, quantity: 5 }, { productId: 12, quantity: 1 }]);
+  assert.throws(() => helpers.normalizeOrderItems([{ productId: 8, quantity: 0 }]), /between 1 and 99/);
+});
+
+test("calculates delivery from server-side item prices", () => {
+  assert.deepEqual(helpers.calculateOrderTotals([{ unitPrice: 150, quantity: 2 }], "delivery"), { subtotal: 300, deliveryFee: 99, total: 399 });
+  assert.deepEqual(helpers.calculateOrderTotals([{ unitPrice: 250, quantity: 4 }], "delivery"), { subtotal: 1000, deliveryFee: 0, total: 1000 });
+  assert.deepEqual(helpers.calculateOrderTotals([{ unitPrice: 150, quantity: 2 }], "pickup"), { subtotal: 300, deliveryFee: 0, total: 300 });
+});

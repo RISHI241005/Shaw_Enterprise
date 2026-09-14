@@ -1,6 +1,7 @@
 package com.shawenterprise.model;
 
 import java.util.List;
+import java.math.BigDecimal;
 
 public record ProductDto(
     long id,
@@ -8,6 +9,10 @@ public record ProductDto(
     String name,
     String category,
     String price,
+    BigDecimal unitPrice,
+    int stockQuantity,
+    boolean orderingEnabled,
+    boolean inStock,
     String productType,
     String summary,
     String details,

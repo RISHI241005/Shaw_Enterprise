@@ -6,6 +6,9 @@ Production-oriented website for a wholesale and retail disposable-products busin
 
 - Responsive Home, Products, Feedback, Contact, Login, and Admin pages
 - 300-product MySQL catalog with search, category filters, sorting, details, product images, and reviews
+- End-to-end online ordering with a persistent cart, delivery or pickup checkout, server-verified prices, and atomic stock updates
+- Customer order history and secure order recovery using the order number plus checkout phone number
+- Admin fulfilment queue with controlled status transitions, cancellation restocking, audit logs, and live order updates
 - Transactional product create/update/delete APIs
 - Contact enquiries stored directly in MySQL and managed through status workflows
 - Email-verified feedback, replies, likes/hearts, product reviews, and admin moderation
@@ -72,6 +75,9 @@ Public:
 
 - `GET /api/products`
 - `GET /api/products/{id}`
+- `POST /api/orders` (checkout; cash on delivery or pay on pickup)
+- `GET /api/orders` (orders placed by the current visitor device)
+- `POST /api/orders/lookup` (recover an order with its reference and phone number)
 - `POST /api/inquiries`
 - `GET /api/feedback`
 - `POST /api/feedback/request-otp` (visible dummy OTP for email or phone)
@@ -82,6 +88,7 @@ Public:
 
 Authenticated admin:
 
+- Order management under `/api/admin/orders`
 - Product CRUD under `/api/admin/products`
 - Enquiry management under `/api/admin/inquiries`
 - Moderation under `/api/admin/feedback`
@@ -89,6 +96,12 @@ Authenticated admin:
 - Business/map settings at `/api/admin/settings`
 
 All write endpoints require the CSRF token supplied in the page's `csrf-token` meta element.
+
+## Online ordering behavior
+
+The listed product price is treated as the price of one displayed pack. Administrators can manage the numeric online price, available pack count, and whether online ordering is enabled from **Admin → Products**. Checkout always reloads those values from MySQL, rejects stale or unavailable cart items, and deducts inventory in the same transaction that creates the order.
+
+Delivery costs Rs. 99 and is free for subtotals of Rs. 1,000 or more; pickup is free. The current implementation deliberately offers cash on delivery and pay on pickup only. Add a real payment provider with signed webhook verification before advertising prepaid card or UPI payments.
 
 ## Vercel deployment
 

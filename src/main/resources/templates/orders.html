@@ -1,0 +1,5 @@
+<!doctype html><html lang="en" xmlns:th="http://www.thymeleaf.org" th:replace="~{layout :: layout('My Orders', ~{::main})}">
+<main>
+  <section class="page-title compact"><p class="eyebrow">Order tracking</p><h1>Follow your order.</h1><p>Orders placed on this device appear automatically. You can also recover an order with its reference and phone number.</p></section>
+  <section class="orders-shell"><form id="orderLookupForm" class="order-lookup"><label>Order number<input name="orderNumber" required maxlength="32" placeholder="SE-20260914-AB12CD34" /></label><label>Phone number<input name="phone" type="tel" required maxlength="40" placeholder="Phone used at checkout" /></label><button class="button primary" type="submit">Find order</button><p class="form-note lookup-status" aria-live="polite"></p></form><div class="section-head"><div><p class="eyebrow">Order history</p><h2>Orders from this device</h2></div></div><div id="customerOrders" class="customer-orders"><p class="empty">Loading your orders…</p></div></section>
+</main></html>

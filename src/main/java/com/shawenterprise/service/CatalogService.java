@@ -52,7 +52,11 @@ public class CatalogService {
         inquiries.forEach(row -> inquiryMap.put(String.valueOf(row.get("status")), ((Number) row.get("count")).longValue()));
         inquiryMap.put("total", inquiryMap.values().stream().mapToLong(Long::longValue).sum());
         var feedback = jdbc.queryForObject("SELECT COUNT(*) FROM feedback_comments WHERE status='visible'", Long.class);
-        return Map.of("totalProducts", products.size(), "categories", categories, "featured", featured, "inquiries", inquiryMap, "feedback", feedback == null ? 0L : feedback);
+        var orderRows = jdbc.queryForList("SELECT status,COUNT(*) count FROM orders GROUP BY status");
+        var orderMap = new LinkedHashMap<String, Long>();
+        orderMap.put("placed", 0L); orderMap.put("active", 0L); orderMap.put("total", 0L);
+        orderRows.forEach(row -> { var count = ((Number) row.get("count")).longValue(); var status = String.valueOf(row.get("status")); orderMap.put("total", orderMap.get("total") + count); if ("placed".equals(status)) orderMap.put("placed", count); if (!List.of("delivered","cancelled").contains(status)) orderMap.put("active", orderMap.get("active") + count); });
+        return Map.of("totalProducts", products.size(), "categories", categories, "featured", featured, "inquiries", inquiryMap, "orders", orderMap, "feedback", feedback == null ? 0L : feedback);
     }
 
     @Transactional
@@ -62,21 +66,24 @@ public class CatalogService {
         var key = new GeneratedKeyHolder();
         jdbc.update(connection -> {
             var statement = connection.prepareStatement("""
-                INSERT INTO products(category_id,name,sku,price_label,product_type,summary,details,pack_size,audience,featured,status,created_at,updated_at)
-                VALUES (?,?,?, ?,?,?,?,?,?,?, 'active',?,?)
+                INSERT INTO products(category_id,name,sku,price_label,unit_price,stock_quantity,ordering_enabled,product_type,summary,details,pack_size,audience,featured,status,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'active',?,?)
                 """, Statement.RETURN_GENERATED_KEYS);
             statement.setLong(1, categoryId);
             statement.setString(2, clean(request.name()));
             statement.setString(3, "PENDING-" + System.nanoTime());
             statement.setString(4, clean(request.price()));
-            statement.setString(5, clean(request.productType()));
-            statement.setString(6, clean(request.summary()));
-            statement.setString(7, clean(request.details()));
-            statement.setString(8, clean(request.packSize()));
-            statement.setString(9, clean(request.audience()));
-            statement.setBoolean(10, request.featured());
-            statement.setTimestamp(11, Timestamp.valueOf(now));
-            statement.setTimestamp(12, Timestamp.valueOf(now));
+            statement.setBigDecimal(5, request.unitPrice());
+            statement.setInt(6, request.stockQuantity());
+            statement.setBoolean(7, request.orderingEnabled());
+            statement.setString(8, clean(request.productType()));
+            statement.setString(9, clean(request.summary()));
+            statement.setString(10, clean(request.details()));
+            statement.setString(11, clean(request.packSize()));
+            statement.setString(12, clean(request.audience()));
+            statement.setBoolean(13, request.featured());
+            statement.setTimestamp(14, Timestamp.valueOf(now));
+            statement.setTimestamp(15, Timestamp.valueOf(now));
             return statement;
         }, key);
         var id = key.getKey().longValue();
@@ -90,8 +97,8 @@ public class CatalogService {
     public ProductDto update(long id, ProductRequest request) {
         get(id);
         var changed = jdbc.update("""
-            UPDATE products SET category_id=?,name=?,price_label=?,product_type=?,summary=?,details=?,pack_size=?,audience=?,featured=?,updated_at=? WHERE id=?
-            """, category(request.category()), clean(request.name()), clean(request.price()), clean(request.productType()), clean(request.summary()),
+            UPDATE products SET category_id=?,name=?,price_label=?,unit_price=?,stock_quantity=?,ordering_enabled=?,product_type=?,summary=?,details=?,pack_size=?,audience=?,featured=?,updated_at=? WHERE id=?
+            """, category(request.category()), clean(request.name()), clean(request.price()), request.unitPrice(), request.stockQuantity(), request.orderingEnabled(), clean(request.productType()), clean(request.summary()),
             clean(request.details()), clean(request.packSize()), clean(request.audience()), request.featured(), Timestamp.valueOf(LocalDateTime.now()), id);
         if (changed == 0) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Product not found");
         replaceImages(id, request.images(), request.name());
@@ -107,7 +114,7 @@ public class CatalogService {
 
     private List<ProductDto> query(String suffix, Object[] args) {
         var rows = jdbc.queryForList("""
-            SELECT p.id,p.sku,p.name,c.name category,p.price_label,p.product_type,p.summary,p.details,p.pack_size,p.audience,p.featured
+            SELECT p.id,p.sku,p.name,c.name category,p.price_label,p.unit_price,p.stock_quantity,p.ordering_enabled,p.product_type,p.summary,p.details,p.pack_size,p.audience,p.featured
             FROM products p JOIN product_categories c ON c.id=p.category_id
             """ + suffix, args);
         var ids = rows.stream().map(row -> ((Number) row.get("id")).longValue()).toList();
@@ -119,6 +126,7 @@ public class CatalogService {
         }
         return rows.stream().map(row -> new ProductDto(
             ((Number) row.get("id")).longValue(), string(row, "sku"), string(row, "name"), string(row, "category"), string(row, "price_label"),
+            (java.math.BigDecimal) row.get("unit_price"), ((Number) row.get("stock_quantity")).intValue(), truthy(row.get("ordering_enabled")), truthy(row.get("ordering_enabled")) && ((Number) row.get("stock_quantity")).intValue() > 0,
             string(row, "product_type"), string(row, "summary"), string(row, "details"), string(row, "pack_size"), string(row, "audience"),
             images.getOrDefault(((Number) row.get("id")).longValue(), List.of()), truthy(row.get("featured"))
         )).toList();

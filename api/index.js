@@ -14,6 +14,8 @@ const ADMIN_USER = process.env.ADMIN_USER || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "change-this-admin-password";
 const SESSION_SECRET = process.env.SESSION_SECRET || process.env.OTP_SECRET || "local-session-secret-change-me";
 const OTP_SECRET = process.env.OTP_SECRET || SESSION_SECRET;
+const DELIVERY_FEE = 99;
+const FREE_DELIVERY_MINIMUM = 1000;
 const rateLimits = new Map();
 let schemaPromise;
 
@@ -52,6 +54,19 @@ const q = async (sql, params = []) => (await dbPool().query(sql, params))[0];
 const one = async (sql, params = []) => (await q(sql, params))[0] || null;
 const now = () => new Date();
 
+function parsePriceAmount(value) {
+  const match = String(value || "").replace(/,/g, "").match(/(?:rs\.?|inr|₹)?\s*([0-9]+(?:\.[0-9]{1,2})?)/i);
+  const amount = match ? Number(match[1]) : NaN;
+  return Number.isFinite(amount) && amount >= 0 ? Math.round(amount * 100) / 100 : null;
+}
+function money(value) { return Math.round((Number(value) + Number.EPSILON) * 100) / 100; }
+function publicError(statusCode, message) { const error = new Error(message); error.statusCode = statusCode; error.isPublic = true; return error; }
+function cleanText(value, maximum) { return String(value || "").trim().slice(0, maximum); }
+function orderNumber() {
+  const day = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  return `SE-${day}-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
+}
+
 const catalogBlueprints = [
   ["Cups", ["Ripple Paper Cup", "Plain Paper Cup", "Printed Tea Cup", "Double Wall Coffee Cup", "Cold Drink Paper Cup", "Kulhad Style Cup"], "Hot and cold beverage disposable", "50 pcs, 100 pcs, bulk carton", "Tea stalls, cafes, offices, caterers", "Disposable cups for tea, coffee, juice, events, and counters.", "Food-grade disposable cups with dependable rim strength and practical insulation.", 68],
   ["Plates", ["Round Paper Plate", "Compartment Meal Plate", "Silver Laminated Plate", "Snack Paper Plate", "Heavy Duty Dinner Plate", "Eco Bagasse Plate"], "Meal serving disposable", "100 pcs, 500 pcs, wholesale carton", "Caterers, households, event managers, retailers", "Strong disposable plates for meals, snacks, events, and food counters.", "Sturdy disposable plates designed for easy stacking and reliable food service.", 90],
@@ -77,9 +92,22 @@ async function ensureSchema() {
       `CREATE TABLE IF NOT EXISTS feedback_reactions (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, feedback_id BIGINT UNSIGNED NOT NULL, visitor_id VARCHAR(80) NOT NULL, reaction VARCHAR(20) NOT NULL, created_at DATETIME NOT NULL, UNIQUE KEY uq_feedback_reaction_visitor(feedback_id, visitor_id))`,
       `CREATE TABLE IF NOT EXISTS admin_audit_logs (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, action_type VARCHAR(80) NOT NULL, target_type VARCHAR(80) NOT NULL, target_id VARCHAR(80), details TEXT NOT NULL, ip_address VARCHAR(80) NOT NULL, created_at DATETIME NOT NULL, INDEX idx_audit_created(created_at))`,
       `CREATE TABLE IF NOT EXISTS business_settings (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, setting_key VARCHAR(120) NOT NULL UNIQUE, setting_value TEXT NOT NULL, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)`,
-      `CREATE TABLE IF NOT EXISTS sync_state (topic VARCHAR(40) PRIMARY KEY, version BIGINT NOT NULL DEFAULT 0, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)`
+      `CREATE TABLE IF NOT EXISTS sync_state (topic VARCHAR(40) PRIMARY KEY, version BIGINT NOT NULL DEFAULT 0, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)`,
+      `CREATE TABLE IF NOT EXISTS orders (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, order_number VARCHAR(32) NOT NULL UNIQUE, visitor_id VARCHAR(80) NOT NULL, customer_name VARCHAR(160) NOT NULL, email VARCHAR(180) NOT NULL, phone VARCHAR(40) NOT NULL, fulfillment_method VARCHAR(20) NOT NULL, payment_method VARCHAR(30) NOT NULL, address_line VARCHAR(255) NOT NULL DEFAULT '', city VARCHAR(120) NOT NULL DEFAULT '', state VARCHAR(120) NOT NULL DEFAULT '', postal_code VARCHAR(20) NOT NULL DEFAULT '', notes TEXT NOT NULL, status VARCHAR(30) NOT NULL DEFAULT 'placed', subtotal DECIMAL(12,2) NOT NULL, delivery_fee DECIMAL(12,2) NOT NULL DEFAULT 0, total DECIMAL(12,2) NOT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, INDEX idx_orders_visitor_created(visitor_id,created_at), INDEX idx_orders_status_created(status,created_at), INDEX idx_orders_phone_number(phone,order_number))`,
+      `CREATE TABLE IF NOT EXISTS order_items (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, order_id BIGINT UNSIGNED NOT NULL, product_id BIGINT UNSIGNED NULL, sku VARCHAR(60) NOT NULL, product_name VARCHAR(180) NOT NULL, price_label VARCHAR(80) NOT NULL, unit_price DECIMAL(12,2) NOT NULL, quantity INT UNSIGNED NOT NULL, line_total DECIMAL(12,2) NOT NULL, created_at DATETIME NOT NULL, INDEX idx_order_items_order(order_id), INDEX idx_order_items_product(product_id))`
     ];
     for (const sql of statements) await q(sql);
+    for (const [column, definition] of [
+      ["unit_price", "DECIMAL(12,2) NULL"],
+      ["stock_quantity", "INT UNSIGNED NOT NULL DEFAULT 100"],
+      ["ordering_enabled", "BOOLEAN NOT NULL DEFAULT TRUE"]
+    ]) {
+      const existing = await one("SELECT COUNT(*) count FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='products' AND COLUMN_NAME=?", [column]);
+      if (!Number(existing?.count || 0)) {
+        try { await q(`ALTER TABLE products ADD COLUMN ${column} ${definition}`); }
+        catch (error) { if (Number(error?.errno) !== 1060) throw error; }
+      }
+    }
     const identityChannel = await one("SELECT COUNT(*) count FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='feedback_identities' AND COLUMN_NAME='verification_channel'");
     if (!Number(identityChannel?.count || 0)) {
       try {
@@ -91,9 +119,11 @@ async function ensureSchema() {
     await q(`INSERT IGNORE INTO business_settings(setting_key,setting_value) VALUES
       ('business_name','Shaw Enterprise'),('phone','+91 00000 00000'),('email','sales@shawenterprise.example'),
       ('address','Kolkata, West Bengal, India'),('whatsapp','910000000000'),('hours','Monday to Saturday, 10:00 AM–7:00 PM')`);
-    await q("INSERT IGNORE INTO sync_state(topic,version) VALUES ('products',0),('feedback',0),('inquiries',0),('settings',0)");
+    await q("INSERT IGNORE INTO sync_state(topic,version) VALUES ('products',0),('feedback',0),('inquiries',0),('settings',0),('orders',0)");
     const count = Number((await one("SELECT COUNT(*) count FROM products"))?.count || 0);
     if (count === 0) await seedCatalog();
+    const missingPrices = await q("SELECT id,price_label FROM products WHERE unit_price IS NULL");
+    for (const row of missingPrices) await q("UPDATE products SET unit_price=? WHERE id=?", [parsePriceAmount(row.price_label) || 0, row.id]);
   })().catch((error) => { schemaPromise = null; throw error; });
   return schemaPromise;
 }
@@ -111,9 +141,9 @@ async function seedCatalog() {
     const packCount = [25, 50, 100, 200, 500][index % 5];
     const itemName = `${size} ${names[Math.floor(index / catalogBlueprints.length) % names.length]} ${String(index + 1).padStart(3, "0")}`;
     const price = basePrice + (index % 17) * 7 + Math.floor(index / 20) * 3;
-    products.push([categories[category], itemName, `SE-${String(index + 1).padStart(4, "0")}`, `Rs. ${price} / ${packCount} pcs`, type, summary, `${details} Item code SE-${String(index + 1).padStart(4, "0")} is suited for regular replenishment.`, pack, audience, index < 12, "active", created, created]);
+    products.push([categories[category], itemName, `SE-${String(index + 1).padStart(4, "0")}`, `Rs. ${price} / ${packCount} pcs`, price, 100, true, type, summary, `${details} Item code SE-${String(index + 1).padStart(4, "0")} is suited for regular replenishment.`, pack, audience, index < 12, "active", created, created]);
   }
-  await q("INSERT INTO products(category_id,name,sku,price_label,product_type,summary,details,pack_size,audience,featured,status,created_at,updated_at) VALUES ?", [products]);
+  await q("INSERT INTO products(category_id,name,sku,price_label,unit_price,stock_quantity,ordering_enabled,product_type,summary,details,pack_size,audience,featured,status,created_at,updated_at) VALUES ?", [products]);
   const ids = await q("SELECT id,name,category_id FROM products ORDER BY id");
   const categoryNames = Object.fromEntries(Object.entries(categories).map(([name, id]) => [String(id), name.toLowerCase()]));
   const images = [];
@@ -183,7 +213,7 @@ async function products() {
   const images = await q("SELECT product_id,image_data FROM product_images ORDER BY product_id,sort_order");
   const grouped = new Map();
   for (const image of images) { if (!grouped.has(String(image.product_id))) grouped.set(String(image.product_id), []); grouped.get(String(image.product_id)).push(image.image_data); }
-  return rows.map((row) => ({ id: Number(row.id), sku: row.sku, name: row.name, category: row.category, price: row.price_label, productType: row.product_type, summary: row.summary, details: row.details, packSize: row.pack_size, audience: row.audience, images: grouped.get(String(row.id)) || [], featured: Boolean(row.featured), createdAt: row.created_at, updatedAt: row.updated_at }));
+  return rows.map((row) => ({ id: Number(row.id), sku: row.sku, name: row.name, category: row.category, price: row.price_label, unitPrice: Number(row.unit_price ?? parsePriceAmount(row.price_label) ?? 0), stockQuantity: Number(row.stock_quantity || 0), orderingEnabled: Boolean(row.ordering_enabled), inStock: Boolean(row.ordering_enabled) && Number(row.stock_quantity || 0) > 0, productType: row.product_type, summary: row.summary, details: row.details, packSize: row.pack_size, audience: row.audience, images: grouped.get(String(row.id)) || [], featured: Boolean(row.featured), createdAt: row.created_at, updatedAt: row.updated_at }));
 }
 async function product(id) { return (await products()).find((item) => item.id === Number(id)) || null; }
 async function business() {
@@ -192,9 +222,10 @@ async function business() {
   return { business_name: values.business_name || "Shaw Enterprise", phone: values.phone || "", email: values.email || "", address: values.address || "", whatsapp: String(values.whatsapp || "").replace(/\D/g, ""), hours: values.hours || "", mapEmbedUrl: `https://maps.google.com/maps?q=${destination}&z=16&output=embed`, mapDirectionsUrl: `https://www.google.com/maps/dir/?api=1&destination=${destination}&dir_action=navigate`, mapSearchUrl: `https://www.google.com/maps/search/?api=1&query=${destination}` };
 }
 async function metrics() {
-  const [p, f, inquiryRows] = await Promise.all([one("SELECT COUNT(*) count,SUM(featured) featured FROM products WHERE status='active'"), one("SELECT COUNT(*) count FROM feedback_comments WHERE status='visible'"), q("SELECT status,COUNT(*) count FROM inquiries GROUP BY status")]);
+  const [p, f, inquiryRows, orderRows] = await Promise.all([one("SELECT COUNT(*) count,SUM(featured) featured FROM products WHERE status='active'"), one("SELECT COUNT(*) count FROM feedback_comments WHERE status='visible'"), q("SELECT status,COUNT(*) count FROM inquiries GROUP BY status"), q("SELECT status,COUNT(*) count FROM orders GROUP BY status")]);
   const statuses = Object.fromEntries(inquiryRows.map((row) => [row.status, Number(row.count)]));
-  return { totalProducts: Number(p?.count || 0), featured: Number(p?.featured || 0), feedback: Number(f?.count || 0), inquiries: { new: statuses.new || 0, contacted: statuses.contacted || 0, closed: statuses.closed || 0, total: inquiryRows.reduce((sum, row) => sum + Number(row.count), 0) } };
+  const orderStatuses = Object.fromEntries(orderRows.map((row) => [row.status, Number(row.count)]));
+  return { totalProducts: Number(p?.count || 0), featured: Number(p?.featured || 0), feedback: Number(f?.count || 0), inquiries: { new: statuses.new || 0, contacted: statuses.contacted || 0, closed: statuses.closed || 0, total: inquiryRows.reduce((sum, row) => sum + Number(row.count), 0) }, orders: { placed: orderStatuses.placed || 0, active: orderRows.filter((row) => !["delivered","cancelled"].includes(row.status)).reduce((sum,row)=>sum+Number(row.count),0), total: orderRows.reduce((sum,row)=>sum+Number(row.count),0) } };
 }
 async function bump(topic) { await q("INSERT INTO sync_state(topic,version) VALUES (?,1) ON DUPLICATE KEY UPDATE version=version+1", [topic]); }
 async function audit(req, action, target, id, details = "") { await q("INSERT INTO admin_audit_logs(action_type,target_type,target_id,details,ip_address,created_at) VALUES (?,?,?,?,?,?)", [action, target, String(id || ""), details, clientIp(req), now()]); }
@@ -216,12 +247,105 @@ async function feedbackThreads(visitorId, options = {}) {
   return roots.sort((a, b) => options.sort === "top" ? (b.reactions.like + b.reactions.heart * 2 + b.replies.length) - (a.reactions.like + a.reactions.heart * 2 + a.replies.length) : new Date(b.createdAt) - new Date(a.createdAt));
 }
 
+function orderView(row, items = []) {
+  return {
+    id: Number(row.id), orderNumber: row.order_number, customerName: row.customer_name,
+    email: row.email, phone: row.phone, fulfillmentMethod: row.fulfillment_method,
+    paymentMethod: row.payment_method, addressLine: row.address_line, city: row.city,
+    state: row.state, postalCode: row.postal_code, notes: row.notes || "", status: row.status,
+    subtotal: Number(row.subtotal), deliveryFee: Number(row.delivery_fee), total: Number(row.total),
+    createdAt: row.created_at, updatedAt: row.updated_at,
+    items: items.map((item) => ({ id: Number(item.id), productId: item.product_id ? Number(item.product_id) : null, sku: item.sku, productName: item.product_name, price: item.price_label, unitPrice: Number(item.unit_price), quantity: Number(item.quantity), lineTotal: Number(item.line_total) }))
+  };
+}
+
+async function orderList(whereSql, params = [], limit = 50) {
+  const rows = await q(`SELECT * FROM orders WHERE ${whereSql} ORDER BY created_at DESC LIMIT ${Number(limit)}` , params);
+  if (!rows.length) return [];
+  const ids = rows.map((row) => Number(row.id));
+  const itemRows = await q(`SELECT * FROM order_items WHERE order_id IN (${ids.map(() => "?").join(",")}) ORDER BY id`, ids);
+  return rows.map((row) => orderView(row, itemRows.filter((item) => Number(item.order_id) === Number(row.id))));
+}
+
+const allowedOrderTransitions = {
+  placed: ["confirmed", "cancelled"], confirmed: ["packing", "cancelled"],
+  packing: ["ready", "cancelled"], ready: ["out_for_delivery", "delivered", "cancelled"],
+  out_for_delivery: ["delivered", "cancelled"], delivered: [], cancelled: []
+};
+
+function normalizeOrderItems(value) {
+  if (!Array.isArray(value) || !value.length || value.length > 50) throw publicError(400, "Your cart must contain between 1 and 50 products.");
+  const quantities = new Map();
+  for (const item of value) {
+    const productId = Number(item?.productId);
+    const quantity = Number(item?.quantity);
+    if (!Number.isSafeInteger(productId) || productId < 1 || !Number.isSafeInteger(quantity) || quantity < 1 || quantity > 99) throw publicError(400, "Each cart quantity must be between 1 and 99 packs.");
+    quantities.set(productId, (quantities.get(productId) || 0) + quantity);
+  }
+  if ([...quantities.values()].some((quantity) => quantity > 99)) throw publicError(400, "A product cannot exceed 99 packs per order.");
+  return [...quantities].map(([productId, quantity]) => ({ productId, quantity }));
+}
+
+function calculateOrderTotals(items, fulfillmentMethod) {
+  const subtotal = money(items.reduce((sum, item) => sum + Number(item.unitPrice) * Number(item.quantity), 0));
+  const deliveryFee = fulfillmentMethod === "delivery" && subtotal < FREE_DELIVERY_MINIMUM ? DELIVERY_FEE : 0;
+  return { subtotal, deliveryFee, total: money(subtotal + deliveryFee) };
+}
+
+async function createOrder(req) {
+  const customerName = cleanText(req.body.customerName, 160);
+  const email = normalizeEmail(req.body.email);
+  const phone = normalizePhone(req.body.phone);
+  const fulfillmentMethod = req.body.fulfillmentMethod === "pickup" ? "pickup" : "delivery";
+  const paymentMethod = fulfillmentMethod === "pickup" ? "pay_on_pickup" : "cash_on_delivery";
+  const addressLine = fulfillmentMethod === "delivery" ? cleanText(req.body.addressLine, 255) : "";
+  const city = fulfillmentMethod === "delivery" ? cleanText(req.body.city, 120) : "";
+  const region = fulfillmentMethod === "delivery" ? cleanText(req.body.state, 120) : "";
+  const postalCode = fulfillmentMethod === "delivery" ? cleanText(req.body.postalCode, 20).toUpperCase() : "";
+  const notes = cleanText(req.body.notes, 1000);
+  if (customerName.length < 2) throw publicError(400, "Enter the customer's full name.");
+  if (!email) throw publicError(400, "Enter a valid email address.");
+  if (!phone) throw publicError(400, "Enter a valid phone number.");
+  if (fulfillmentMethod === "delivery" && (!addressLine || !city || !region || !/^[A-Z0-9][A-Z0-9 -]{2,18}[A-Z0-9]$/i.test(postalCode))) throw publicError(400, "Enter a complete delivery address and valid postal code.");
+  const requested = normalizeOrderItems(req.body.items);
+  const connection = await dbPool().getConnection();
+  try {
+    await connection.beginTransaction();
+    const ids = requested.map((item) => item.productId);
+    const [rows] = await connection.query(`SELECT id,sku,name,price_label,unit_price,stock_quantity,ordering_enabled,status FROM products WHERE id IN (${ids.map(() => "?").join(",")}) FOR UPDATE`, ids);
+    if (rows.length !== requested.length) throw publicError(409, "One or more products are no longer available.");
+    const orderItems = requested.map((requestedItem) => {
+      const productRow = rows.find((row) => Number(row.id) === requestedItem.productId);
+      const unitPrice = Number(productRow.unit_price ?? parsePriceAmount(productRow.price_label) ?? 0);
+      if (productRow.status !== "active" || !productRow.ordering_enabled) throw publicError(409, `${productRow.name} is not available for online ordering.`);
+      if (requestedItem.quantity > Number(productRow.stock_quantity)) throw publicError(409, `Only ${Number(productRow.stock_quantity)} pack(s) of ${productRow.name} are currently available.`);
+      if (!(unitPrice > 0)) throw publicError(409, `${productRow.name} does not have a valid online price.`);
+      return { ...requestedItem, sku: productRow.sku, name: productRow.name, priceLabel: productRow.price_label, unitPrice, lineTotal: money(unitPrice * requestedItem.quantity) };
+    });
+    const { subtotal, deliveryFee, total } = calculateOrderTotals(orderItems, fulfillmentMethod);
+    const reference = orderNumber();
+    const created = now();
+    const [result] = await connection.query("INSERT INTO orders(order_number,visitor_id,customer_name,email,phone,fulfillment_method,payment_method,address_line,city,state,postal_code,notes,status,subtotal,delivery_fee,total,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'placed',?,?,?,?,?)", [reference,req.visitorId,customerName,email,phone,fulfillmentMethod,paymentMethod,addressLine,city,region,postalCode,notes,subtotal,deliveryFee,total,created,created]);
+    for (const item of orderItems) {
+      await connection.query("INSERT INTO order_items(order_id,product_id,sku,product_name,price_label,unit_price,quantity,line_total,created_at) VALUES (?,?,?,?,?,?,?,?,?)", [result.insertId,item.productId,item.sku,item.name,item.priceLabel,item.unitPrice,item.quantity,item.lineTotal,created]);
+      await connection.query("UPDATE products SET stock_quantity=stock_quantity-?,updated_at=? WHERE id=?", [item.quantity,created,item.productId]);
+    }
+    await connection.commit();
+    const rowsAfter = await orderList("id=?", [result.insertId], 1);
+    await Promise.all([bump("orders"), bump("products")]);
+    return rowsAfter[0];
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally { connection.release(); }
+}
+
 function productCard(item) {
-  return `<article class="product-card" data-product-id="${item.id}" data-name="${escapeHtml(`${item.name} ${item.category} ${item.summary}`.toLowerCase())}" data-category="${escapeHtml(item.category.toLowerCase())}" data-summary="${escapeHtml(item.summary.toLowerCase())}" data-details="${escapeHtml(item.details.toLowerCase())}" data-pack="${escapeHtml(item.packSize.toLowerCase())}" data-audience="${escapeHtml(item.audience.toLowerCase())}"><img src="${escapeHtml(item.images[0] || "/images/product.svg")}" alt="${escapeHtml(item.name)}"><div class="product-card-body"><p class="tag">${escapeHtml(item.category)}</p><h3>${escapeHtml(item.name)}</h3><p>${escapeHtml(item.summary)}</p><div class="product-meta"><strong>${escapeHtml(item.price)}</strong><span>${escapeHtml(item.packSize)}</span></div><button class="button small view-product" type="button" data-product-id="${item.id}">View Product</button></div></article>`;
+  return `<article class="product-card" data-product-id="${item.id}" data-product-name="${escapeHtml(item.name)}" data-price="${item.unitPrice}" data-price-label="${escapeHtml(item.price)}" data-image="${escapeHtml(item.images[0] || "/images/product.svg")}" data-stock="${item.stockQuantity}" data-name="${escapeHtml(`${item.name} ${item.category} ${item.summary}`.toLowerCase())}" data-category="${escapeHtml(item.category.toLowerCase())}" data-summary="${escapeHtml(item.summary.toLowerCase())}" data-details="${escapeHtml(item.details.toLowerCase())}" data-pack="${escapeHtml(item.packSize.toLowerCase())}" data-audience="${escapeHtml(item.audience.toLowerCase())}"><img src="${escapeHtml(item.images[0] || "/images/product.svg")}" alt="${escapeHtml(item.name)}"><div class="product-card-body"><p class="tag">${escapeHtml(item.category)}</p><h3>${escapeHtml(item.name)}</h3><p>${escapeHtml(item.summary)}</p><div class="product-meta"><strong>${escapeHtml(item.price)}</strong><span>${item.inStock ? `${item.stockQuantity} packs in stock` : "Currently unavailable"}</span></div><div class="product-card-actions"><button class="button small ghost view-product" type="button" data-product-id="${item.id}">View</button><button class="button small primary add-to-cart" type="button" data-product-id="${item.id}" ${item.inStock ? "" : "disabled"}>${item.inStock ? "Add to cart" : "Out of stock"}</button></div></div></article>`;
 }
 function layout(title, content, req, info) {
-  const nav = [["/", "Home"], ["/products", "Products"], ["/feedback", "Feedback"], ["/contact", "Contact"], [isAdmin(req) ? "/admin" : "/login", "Admin"]];
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} | Shaw Enterprise</title><meta name="csrf-token" content="${escapeHtml(req.csrfToken)}"><link rel="stylesheet" href="/styles.css?v=20260911"><script defer src="/client.js?v=20260911"></script></head><body><div class="launch-screen" aria-hidden="true"><div class="launch-mark">SE</div><p>STOCK IN MOTION</p><i></i></div><div class="page-atmosphere" aria-hidden="true"></div><header class="site-header"><a class="brand" href="/"><img src="/logo.svg" alt="Shaw Enterprise"></a><button class="nav-toggle" type="button">Menu</button><nav class="site-nav">${nav.map(([url, label]) => `<a href="${url}">${label}</a>`).join("")}</nav></header><main>${content}</main><footer class="site-footer"><div><strong>${escapeHtml(info.business_name)}</strong><span>Wholesale and retail disposable products.</span></div><div>${escapeHtml(info.phone)} | ${escapeHtml(info.email)}</div></footer></body></html>`;
+  const nav = [["/", "Home"], ["/products", "Products"], ["/orders", "My Orders"], ["/feedback", "Feedback"], ["/contact", "Contact"], [isAdmin(req) ? "/admin" : "/login", "Admin"]];
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="Order disposable food-service products online from Shaw Enterprise."><title>${escapeHtml(title)} | Shaw Enterprise</title><meta name="csrf-token" content="${escapeHtml(req.csrfToken)}"><link rel="stylesheet" href="/styles.css?v=20260914"><script defer src="/client.js?v=20260914"></script></head><body><div class="launch-screen" aria-hidden="true"><div class="launch-mark">SE</div><p>STOCK IN MOTION</p><i></i></div><div class="page-atmosphere" aria-hidden="true"></div><header class="site-header"><a class="brand" href="/"><img src="/logo.svg" alt="Shaw Enterprise"></a><button class="nav-toggle" type="button">Menu</button><nav class="site-nav">${nav.map(([url, label]) => `<a href="${url}">${label}</a>`).join("")}<button class="cart-nav open-cart" type="button" aria-label="Open shopping cart">Cart <span class="cart-count">0</span></button></nav></header><main>${content}</main><aside class="cart-drawer" id="cartDrawer" aria-hidden="true"><button class="cart-backdrop close-cart" type="button" aria-label="Close cart"></button><section class="cart-panel" role="dialog" aria-modal="true" aria-labelledby="cartTitle"><div class="cart-head"><div><p class="eyebrow">Your basket</p><h2 id="cartTitle">Shopping cart</h2></div><button class="panel-close close-cart" type="button">Close</button></div><div class="cart-items" id="cartItems"></div><div class="cart-footer" id="cartFooter"></div></section></aside><footer class="site-footer"><div><strong>${escapeHtml(info.business_name)}</strong><span>Wholesale and retail disposable products.</span></div><div>${escapeHtml(info.phone)} | ${escapeHtml(info.email)}</div></footer></body></html>`;
 }
 
 app.disable("x-powered-by");
@@ -262,11 +386,19 @@ app.get("/healthz", asyncRoute(async (_req, res) => { const count = await one("S
 app.get("/", asyncRoute(async (req, res) => {
   const [items, info, stats] = await Promise.all([products(), business(), metrics()]);
   const featured = items.filter((item) => item.featured).slice(0, 3);
-  res.send(layout("Home", `<section class="hero"><div class="hero-media"></div><div class="hero-content"><div class="hero-topline"><span>INDIA / WHOLESALE SUPPLY</span><span>EST. 2012</span></div><p class="eyebrow">Wholesale and retail disposable products</p><h1><span>Shaw</span> <span class="outline-word">Enterprise</span></h1><p>Reliable cups, plates, containers, cutlery, and packaging supplies for shops, caterers, offices, and events.</p><div class="hero-metrics"><span><strong>${stats.totalProducts}</strong> active SKUs</span><span><strong>${new Set(items.map((i) => i.category)).size}</strong> product types</span><span><strong>${stats.featured}</strong> featured items</span></div><div class="hero-actions"><a class="button primary" href="/products">View Products</a><a class="button ghost" href="https://wa.me/${info.whatsapp}">WhatsApp Enquiry</a></div></div></section><section class="band"><div class="section-head"><p class="eyebrow">About the business</p><h2>Professional supply for everyday food service.</h2></div><div class="feature-grid"><article><span class="feature-icon">01</span><h3>Wholesale Ready</h3><p>Bulk carton supply and consistent repeat-order handling.</p></article><article><span class="feature-icon">02</span><h3>Retail Friendly</h3><p>Practical pack sizes for homes, shops, and event buyers.</p></article><article><span class="feature-icon">03</span><h3>Fast Enquiries</h3><p>Contact through the website, phone, or WhatsApp.</p></article></div></section><section class="band tint"><div class="section-head"><p class="eyebrow">Featured stock</p><h2>Popular disposable items</h2></div><div class="product-grid">${featured.map(productCard).join("")}</div></section><aside class="product-panel" id="productPanel" aria-hidden="true"></aside>`, req, info));
+  res.send(layout("Home", `<section class="hero"><div class="hero-media"></div><div class="hero-content"><div class="hero-topline"><span>INDIA / WHOLESALE SUPPLY</span><span>EST. 2012</span></div><p class="eyebrow">Wholesale and retail disposable products</p><h1><span>Shaw</span> <span class="outline-word">Enterprise</span></h1><p>Reliable cups, plates, containers, cutlery, and packaging supplies—now available to order online for delivery or pickup.</p><div class="hero-metrics"><span><strong>${stats.totalProducts}</strong> active SKUs</span><span><strong>${new Set(items.map((i) => i.category)).size}</strong> product types</span><span><strong>${stats.featured}</strong> featured items</span></div><div class="hero-actions"><a class="button primary" href="/products">Shop Products</a><a class="button ghost" href="/orders">Track an Order</a></div></div></section><section class="band"><div class="section-head"><p class="eyebrow">Ordering made simple</p><h2>Professional supply for everyday food service.</h2></div><div class="feature-grid"><article><span class="feature-icon">01</span><h3>Choose Your Packs</h3><p>Add retail packs or wholesale quantities to one convenient cart.</p></article><article><span class="feature-icon">02</span><h3>Delivery or Pickup</h3><p>Choose doorstep delivery or collect your order from the enterprise.</p></article><article><span class="feature-icon">03</span><h3>Track Every Step</h3><p>Use your order number and phone to follow fulfilment progress.</p></article></div></section><section class="band tint"><div class="section-head"><div><p class="eyebrow">Featured stock</p><h2>Popular disposable items</h2></div><a class="button ghost" href="/products">Shop all products</a></div><div class="product-grid">${featured.map(productCard).join("")}</div></section><aside class="product-panel" id="productPanel" aria-hidden="true"></aside>`, req, info));
 }));
 app.get("/products", asyncRoute(async (req, res) => {
   const [items, info] = await Promise.all([products(), business()]); const categories = [...new Set(items.map((item) => item.category))];
   res.send(layout("Products", `<section class="page-title catalog-title"><p class="eyebrow">Curated product catalog</p><h1>Everything your business needs, in one place.</h1><p>Browse dependable everyday disposables for shops, events, delivery, and food service.</p></section><section class="band"><div class="catalog-toolbar"><div class="catalog-toolbar-top"><label class="catalog-search-field"><span>⌕</span><input id="productSearch" type="search" placeholder="Search products, categories or uses"></label><label class="catalog-sort-field"><span>Sort</span><select id="productSort"><option value="featured">Featured first</option><option value="name-asc">Name: A–Z</option><option value="name-desc">Name: Z–A</option></select></label></div><div class="catalog-filter-row"><button class="filter-chip active" type="button" data-category="all">All <span>${items.length}</span></button>${categories.map((category) => `<button class="filter-chip" type="button" data-category="${escapeHtml(category.toLowerCase())}">${escapeHtml(category)}</button>`).join("")}</div><div class="catalog-status"><p id="catalogCount">Showing all ${items.length} products</p><p class="catalog-empty" hidden>No products found.</p></div></div><div class="product-grid" id="productGrid">${items.map(productCard).join("")}</div></section><aside class="product-panel" id="productPanel" aria-hidden="true"></aside>`, req, info));
+}));
+app.get("/checkout", asyncRoute(async (req, res) => {
+  const info = await business();
+  res.send(layout("Checkout", `<section class="page-title compact"><p class="eyebrow">Secure checkout</p><h1>Complete your order.</h1><p>Prices and stock are rechecked when you place the order.</p></section><section class="checkout-shell"><form id="checkoutForm" class="checkout-form"><div class="checkout-card"><div class="section-head"><div><p class="eyebrow">Contact</p><h2>Customer details</h2></div></div><div class="form-grid"><label>Full name<input name="customerName" autocomplete="name" required maxlength="160"></label><label>Email<input name="email" type="email" autocomplete="email" required maxlength="180"></label><label>Phone<input name="phone" type="tel" autocomplete="tel" required maxlength="40" placeholder="+91 98765 43210"></label></div></div><div class="checkout-card"><div class="section-head"><div><p class="eyebrow">Fulfilment</p><h2>How should we prepare it?</h2></div></div><div class="fulfilment-options"><label><input type="radio" name="fulfillmentMethod" value="delivery" checked><span><strong>Delivery</strong><small>₹${DELIVERY_FEE}; free above ₹${FREE_DELIVERY_MINIMUM}</small></span></label><label><input type="radio" name="fulfillmentMethod" value="pickup"><span><strong>Store pickup</strong><small>No delivery fee</small></span></label></div><div class="form-grid address-fields"><label class="wide">Address<input name="addressLine" autocomplete="street-address" required maxlength="255"></label><label>City<input name="city" autocomplete="address-level2" required maxlength="120"></label><label>State<input name="state" autocomplete="address-level1" required maxlength="120"></label><label>Postal code<input name="postalCode" autocomplete="postal-code" required maxlength="20"></label></div><label>Order note (optional)<textarea name="notes" rows="3" maxlength="1000" placeholder="Delivery landmark, preferred pickup time, or packing request"></textarea></label></div><div class="checkout-card payment-note"><p class="eyebrow">Payment</p><h2 id="paymentMethodTitle">Cash on delivery</h2><p id="paymentMethodCopy">Pay when your order reaches you. No card details are collected on this website.</p></div><button class="button primary checkout-submit" type="submit">Place order</button><p class="form-note checkout-status" aria-live="polite"></p></form><aside class="checkout-summary"><p class="eyebrow">Order summary</p><h2>Your cart</h2><div id="checkoutItems"></div><div id="checkoutTotals"></div></aside></section>`, req, info));
+}));
+app.get("/orders", asyncRoute(async (req, res) => {
+  const info = await business();
+  res.send(layout("My Orders", `<section class="page-title compact"><p class="eyebrow">Order tracking</p><h1>Follow your order.</h1><p>Orders placed on this device appear automatically. You can also recover an order with its reference and phone number.</p></section><section class="orders-shell"><form id="orderLookupForm" class="order-lookup"><label>Order number<input name="orderNumber" required maxlength="32" placeholder="SE-20260914-AB12CD34"></label><label>Phone number<input name="phone" type="tel" required maxlength="40" placeholder="Phone used at checkout"></label><button class="button primary" type="submit">Find order</button><p class="form-note lookup-status" aria-live="polite"></p></form><div class="section-head"><div><p class="eyebrow">Order history</p><h2>Orders from this device</h2></div></div><div id="customerOrders" class="customer-orders"><p class="empty">Loading your orders…</p></div></section>`, req, info));
 }));
 app.get("/feedback", asyncRoute(async (req, res) => { const [identity, info] = await Promise.all([one("SELECT email,verification_channel,verified FROM feedback_identities WHERE visitor_id=?", [req.visitorId]), business()]); const identityView = publicIdentity(identity); res.send(layout("Feedback", `<section class="page-title compact"><p class="eyebrow">Community feedback</p><h1>Customer feedback and product reviews.</h1></section><section class="feedback-shell" data-identity='${escapeHtml(JSON.stringify(identityView))}'><form class="feedback-form" id="feedbackForm"><div id="feedbackIdentity"></div><label>Feedback<textarea name="message" rows="4" placeholder="Share your experience" required maxlength="5000"></textarea></label><button class="button primary" type="submit">Post Feedback</button><p class="form-note" id="otpNote"></p></form><div class="feedback-toolbar"><strong>Comments</strong><select id="feedbackSort"><option value="top">Top</option><option value="newest">Newest</option></select></div><div id="feedbackList" class="feedback-list"></div><button class="button ghost" id="loadMoreFeedback" type="button">Load More</button></section>`, req, info)); }));
 app.get("/contact", asyncRoute(async (req, res) => { const info = await business(); res.send(layout("Contact", `<section class="page-title compact"><p class="eyebrow">Contact & directions</p><h1>Send an enquiry or plan your visit.</h1></section><section class="contact-layout"><form class="contact-form"><label>Name<input name="name" required maxlength="160"></label><label>Email<input name="email" type="email" required maxlength="180"></label><label>Phone<input name="phone" required maxlength="60"></label><label>Message<textarea name="message" rows="5" required maxlength="5000"></textarea></label><button class="button primary" type="submit">Send Enquiry</button><p class="form-note contact-note"></p></form><aside class="contact-card"><p class="eyebrow">Business details</p><h2>${escapeHtml(info.business_name)}</h2><a class="contact-detail" href="tel:${escapeHtml(info.phone)}">${escapeHtml(info.phone)}</a><a class="contact-detail" href="mailto:${escapeHtml(info.email)}">${escapeHtml(info.email)}</a><p>${escapeHtml(info.address)}</p><p>${escapeHtml(info.hours)}</p><div class="contact-actions"><a class="button primary" href="${info.mapDirectionsUrl}" target="_blank" rel="noopener">Get directions</a><a class="button ghost" href="https://wa.me/${info.whatsapp}" target="_blank" rel="noopener">Open WhatsApp</a></div></aside><div class="map-card"><iframe src="${info.mapEmbedUrl}" title="Shaw Enterprise location" loading="lazy" allowfullscreen></iframe><div><strong>Open on your phone</strong><p>Google Maps will guide you to the enterprise.</p><a class="button ghost" href="${info.mapDirectionsUrl}" target="_blank" rel="noopener">Navigate with Google Maps</a></div></div></section>`, req, info)); }));
@@ -274,22 +406,38 @@ app.get("/contact", asyncRoute(async (req, res) => { const info = await business
 app.get("/login", asyncRoute(async (req, res) => { const info = await business(); res.send(layout("Admin Login", `<section class="auth-wrap"><div class="auth-shell"><aside class="auth-intro"><img src="/logo.svg" alt="Shaw Enterprise"><p class="eyebrow">Secure workspace</p><h1>Manage the business with confidence.</h1><p>Protected access and one control centre for your team.</p></aside><div class="auth-card"><div class="auth-card-head"><p class="eyebrow">Administrator portal</p><h2>Welcome back</h2></div><p class="auth-status" id="authStatus"></p><form id="loginForm" class="auth-form"><label>Username<input name="username" autocomplete="username" required></label><label>Password<span class="password-field"><input name="password" type="password" autocomplete="current-password" required><button class="password-toggle" type="button">Show</button></span></label><button class="button primary auth-submit" type="submit">Sign in securely <span>→</span></button></form></div></div></section>`, req, info)); }));
 app.get("/logout", (req, res) => { res.clearCookie("shaw_admin"); res.redirect("/login"); });
 
-function adminTabs(active) { return `<nav class="admin-tabs">${[["products","Products"],["inquiries","Inquiries"],["feedback","Feedback"],["audits","Audits"],["settings","Business & Map"]].map(([key,label]) => `<a class="${active === key ? "active" : ""}" href="/admin/${key}">${label}</a>`).join("")}</nav>`; }
+function adminTabs(active) { return `<nav class="admin-tabs">${[["orders","Orders"],["products","Products"],["inquiries","Inquiries"],["feedback","Feedback"],["audits","Audits"],["settings","Business & Map"]].map(([key,label]) => `<a class="${active === key ? "active" : ""}" href="/admin/${key}">${label}</a>`).join("")}</nav>`; }
 app.get(["/admin", "/admin/:tab"], asyncRoute(async (req, res) => {
-  if (!isAdmin(req)) return res.redirect("/login"); const active = req.params.tab || "products"; const [stats, info] = await Promise.all([metrics(), business()]);
+  if (!isAdmin(req)) return res.redirect("/login"); const active = req.params.tab || "orders"; const [stats, info] = await Promise.all([metrics(), business()]);
   const sections = {
-    products: `<section class="admin-section"><h2>Product Management</h2><form id="productForm" class="admin-form"><input type="hidden" name="id"><label>Name<input name="name" required></label><label>Category<input name="category" required></label><label>Price<input name="price" required></label><label>Type<input name="productType" required></label><label>Pack Size<input name="packSize" required></label><label>Audience<input name="audience" required></label><label>Summary<textarea name="summary" rows="2" required></textarea></label><label>Details<textarea name="details" rows="4" required></textarea></label><label>Product Images<input name="imageFiles" type="file" accept="image/*" multiple></label><input name="images" type="hidden"><div class="image-preview-grid" id="imagePreviewGrid"></div><label class="check"><input name="featured" type="checkbox"> Featured product</label><div class="admin-actions"><button class="button primary" type="submit">Save Product</button><button class="button ghost" id="resetProductForm" type="button">Clear</button></div></form><div id="adminProducts" class="admin-list"></div></section>`,
+    orders: `<section class="admin-section"><div class="section-head"><div><p class="eyebrow">Fulfilment queue</p><h2>Online Orders</h2></div><span class="admin-order-count">${stats.orders.active} active</span></div><div id="adminOrders" class="admin-list"><p class="empty">Loading orders…</p></div></section>`,
+    products: `<section class="admin-section"><h2>Product Management</h2><form id="productForm" class="admin-form"><input type="hidden" name="id"><label>Name<input name="name" required></label><label>Category<input name="category" required></label><label>Display price<input name="price" required placeholder="Rs. 95 / 50 pcs"></label><label>Price per listed pack (₹)<input name="unitPrice" type="number" min="0.01" step="0.01" required></label><label>Available packs<input name="stockQuantity" type="number" min="0" max="100000" step="1" required></label><label>Type<input name="productType" required></label><label>Pack Size<input name="packSize" required></label><label>Audience<input name="audience" required></label><label>Summary<textarea name="summary" rows="2" required></textarea></label><label>Details<textarea name="details" rows="4" required></textarea></label><label>Product Images<input name="imageFiles" type="file" accept="image/*" multiple></label><input name="images" type="hidden"><div class="image-preview-grid" id="imagePreviewGrid"></div><label class="check"><input name="featured" type="checkbox"> Featured product</label><label class="check"><input name="orderingEnabled" type="checkbox" checked> Available for online ordering</label><div class="admin-actions"><button class="button primary" type="submit">Save Product</button><button class="button ghost" id="resetProductForm" type="button">Clear</button></div></form><div id="adminProducts" class="admin-list"></div></section>`,
     inquiries: `<section class="admin-section"><h2>Inquiries</h2><div id="adminInquiries" class="admin-list"></div></section>`,
     feedback: `<section class="admin-section"><h2>Feedback Moderation</h2><div id="adminFeedback" class="admin-list"></div></section>`,
     audits: `<section class="admin-section"><h2>Audit Log</h2><div id="auditLog" class="audit-list"></div></section>`,
     settings: `<section class="admin-section"><div class="section-head"><p class="eyebrow">Single source of truth</p><h2>Business details & map location</h2><p>These values update the public map, footer, phone, email, and WhatsApp links together.</p></div><form id="businessSettingsForm" class="admin-form settings-form"><label>Business name<input name="business_name" value="${escapeHtml(info.business_name)}" required></label><label>Phone<input name="phone" value="${escapeHtml(info.phone)}" required></label><label>Email<input name="email" type="email" value="${escapeHtml(info.email)}" required></label><label>WhatsApp number<input name="whatsapp" value="${escapeHtml(info.whatsapp)}" required></label><label class="wide">Exact enterprise address<input name="address" value="${escapeHtml(info.address)}" required></label><label class="wide">Opening hours<input name="hours" value="${escapeHtml(info.hours)}" required></label><div class="admin-actions wide"><button class="button primary" type="submit">Save & sync everywhere</button><a class="button ghost" href="${info.mapSearchUrl}" target="_blank">Check current map</a></div><p id="settingsStatus" class="form-note wide"></p></form></section>`
   };
-  res.send(layout("Admin", `<section class="admin-shell"><div class="admin-head"><div><p class="eyebrow">Control room</p><h1>Admin Dashboard</h1></div><a class="button ghost" href="/logout">Logout</a></div><section class="admin-command-center"><article><span>${stats.totalProducts}</span><strong>Products</strong><small>${stats.featured} featured SKUs</small></article><article><span>${stats.inquiries.new}</span><strong>New Enquiries</strong><small>${stats.inquiries.total} total</small></article><article><span>${stats.feedback}</span><strong>Visible Feedback</strong><small>Reviews and comments</small></article><article><span>Live</span><strong>MySQL-compatible DB</strong><small>Vercel serverless connection</small></article></section>${adminTabs(active)}${sections[active] || sections.products}</section>`, req, info));
+  res.send(layout("Admin", `<section class="admin-shell"><div class="admin-head"><div><p class="eyebrow">Control room</p><h1>Admin Dashboard</h1></div><a class="button ghost" href="/logout">Logout</a></div><section class="admin-command-center"><article><span>${stats.orders.placed}</span><strong>New Orders</strong><small>${stats.orders.active} need attention</small></article><article><span>${stats.totalProducts}</span><strong>Products</strong><small>${stats.featured} featured SKUs</small></article><article><span>${stats.inquiries.new}</span><strong>New Enquiries</strong><small>${stats.inquiries.total} total</small></article><article><span>${stats.feedback}</span><strong>Visible Feedback</strong><small>Reviews and comments</small></article></section>${adminTabs(active)}${sections[active] || sections.orders}</section>`, req, info));
 }));
 
 app.get("/api/products", asyncRoute(async (_req, res) => res.json({ products: await products() })));
 app.get("/api/products/:id", asyncRoute(async (req, res) => { const item = await product(req.params.id); if (!item) return res.status(404).json({ error: "Product not found" }); res.json({ product: item, reviews: await feedbackThreads(req.visitorId, { productId: item.id, sort: "top" }) }); }));
 app.post("/api/inquiries", requireCsrf, asyncRoute(async (req, res) => { if (!rateLimit(req, "inquiry", 8, 600000)) return res.status(429).json({ error: "Too many enquiries" }); const { name, email, phone, message } = req.body; if (![name,email,phone,message].every((value) => String(value || "").trim())) return res.status(400).json({ error: "All enquiry fields are required" }); const result = await q("INSERT INTO inquiries(name,email,phone,message,status,created_at) VALUES (?,?,?,?, 'new',?)", [String(name).trim(),String(email).trim(),String(phone).trim(),String(message).trim(),now()]); await bump("inquiries"); res.status(201).json({ inquiry: { id: result.insertId, name: String(name).trim() }, message: "Enquiry saved" }); }));
+app.post("/api/orders", requireCsrf, asyncRoute(async (req, res) => {
+  if (!rateLimit(req, "place-order", 10, 600000)) return res.status(429).json({ error: "Too many checkout attempts. Please wait and try again." });
+  const order = await createOrder(req);
+  res.status(201).json({ order, message: `Order ${order.orderNumber} has been placed.` });
+}));
+app.get("/api/orders", asyncRoute(async (req, res) => res.json({ orders: await orderList("visitor_id=?", [req.visitorId], 25) })));
+app.post("/api/orders/lookup", requireCsrf, asyncRoute(async (req, res) => {
+  if (!rateLimit(req, "order-lookup", 20, 600000)) return res.status(429).json({ error: "Too many lookup attempts. Please wait and try again." });
+  const reference = cleanText(req.body.orderNumber, 32).toUpperCase();
+  const phone = normalizePhone(req.body.phone);
+  if (!/^SE-\d{8}-[A-F0-9]{8}$/.test(reference) || !phone) return res.status(400).json({ error: "Enter a valid order number and phone number." });
+  const found = await orderList("order_number=? AND phone=?", [reference,phone], 1);
+  if (!found.length) return res.status(404).json({ error: "No order matched those details." });
+  res.json({ order: found[0] });
+}));
 
 function generateDummyOtp() { return String(crypto.randomInt(100000, 1000000)); }
 
@@ -345,9 +493,35 @@ app.post("/api/feedback/:id/react", requireCsrf, asyncRoute(async (req, res) => 
 app.post("/api/auth/login", requireCsrf, asyncRoute(async (req, res) => { if (!rateLimit(req, "login", 10, 600000)) return res.status(429).json({ error: "Too many login attempts" }); const username = String(req.body.username || ""), password = String(req.body.password || ""); const userMatch = username === ADMIN_USER, passA = Buffer.from(password), passB = Buffer.from(ADMIN_PASSWORD); const passMatch = passA.length === passB.length && crypto.timingSafeEqual(passA, passB); if (!userMatch || !passMatch) { await audit(req,"login_failed","admin",username,"Invalid login attempt"); return res.status(401).json({ error: "Invalid username or password" }); } res.cookie("shaw_admin", signed(`admin:${Date.now()}`), { httpOnly: true, sameSite: "lax", secure: IS_PRODUCTION, maxAge: 8*3600000 }); await audit(req,"login","admin",username,"Admin login successful"); res.json({ redirect: "/admin" }); }));
 
 app.use("/api/admin", requireAdmin);
+app.get("/api/admin/orders", asyncRoute(async (_req,res) => res.json({ orders: await orderList("1=1", [], 100), auditLogs: await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80") })));
+app.post("/api/admin/orders/:id/status", requireCsrf, asyncRoute(async (req,res) => {
+  const id = Number(req.params.id), nextStatus = cleanText(req.body.status, 30);
+  if (!Number.isSafeInteger(id) || id < 1) return res.status(400).json({ error: "Invalid order" });
+  const connection = await dbPool().getConnection();
+  let current;
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.query("SELECT * FROM orders WHERE id=? FOR UPDATE", [id]);
+    current = rows[0];
+    if (!current) throw publicError(404, "Order not found");
+    const nextStatuses = current.status === "ready" ? (current.fulfillment_method === "pickup" ? ["delivered","cancelled"] : ["out_for_delivery","cancelled"]) : (allowedOrderTransitions[current.status] || []);
+    if (!nextStatuses.includes(nextStatus)) throw publicError(409, `Order cannot move from ${current.status} to ${nextStatus}.`);
+    if (nextStatus === "cancelled") {
+      const [items] = await connection.query("SELECT product_id,quantity FROM order_items WHERE order_id=?", [id]);
+      for (const item of items) if (item.product_id) await connection.query("UPDATE products SET stock_quantity=stock_quantity+?,updated_at=? WHERE id=?", [item.quantity,now(),item.product_id]);
+    }
+    await connection.query("UPDATE orders SET status=?,updated_at=? WHERE id=?", [nextStatus,now(),id]);
+    await connection.commit();
+  } catch (error) { await connection.rollback(); throw error; }
+  finally { connection.release(); }
+  await audit(req,"status","order",current.order_number,`${current.status} to ${nextStatus}`);
+  await bump("orders");
+  if (nextStatus === "cancelled") await bump("products");
+  res.json({ orders: await orderList("1=1", [], 100), auditLogs: await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80") });
+}));
 app.get("/api/admin/products", asyncRoute(async (_req,res) => res.json({ products: await products() })));
-app.post("/api/admin/products", requireCsrf, asyncRoute(async (req,res) => { const p=req.body; for (const key of ["name","category","price","productType","summary","details","packSize","audience"]) if (!String(p[key]||"").trim()) return res.status(400).json({error:`${key} is required`}); await q("INSERT IGNORE INTO product_categories(name,description) VALUES (?,?)",[p.category,`${p.category} products`]); const category=await one("SELECT id FROM product_categories WHERE name=?",[p.category]); const result=await q("INSERT INTO products(category_id,name,sku,price_label,product_type,summary,details,pack_size,audience,featured,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?, 'active',?,?)",[category.id,p.name,`SE-${Date.now()}`,p.price,p.productType,p.summary,p.details,p.packSize,p.audience,Boolean(p.featured),now(),now()]); for (const [index,image] of (p.images||[]).entries()) await q("INSERT INTO product_images(product_id,image_data,alt_text,sort_order) VALUES (?,?,?,?)",[result.insertId,image,p.name,index]); await audit(req,"create","product",result.insertId,p.name); await bump("products"); res.status(201).json({products:await products(),auditLogs:await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80")}); }));
-app.put("/api/admin/products/:id", requireCsrf, asyncRoute(async (req,res) => { const id=Number(req.params.id),p=req.body; await q("INSERT IGNORE INTO product_categories(name,description) VALUES (?,?)",[p.category,`${p.category} products`]); const category=await one("SELECT id FROM product_categories WHERE name=?",[p.category]); await q("UPDATE products SET category_id=?,name=?,price_label=?,product_type=?,summary=?,details=?,pack_size=?,audience=?,featured=?,updated_at=? WHERE id=?",[category.id,p.name,p.price,p.productType,p.summary,p.details,p.packSize,p.audience,Boolean(p.featured),now(),id]); await q("DELETE FROM product_images WHERE product_id=?",[id]); for (const [index,image] of (p.images||[]).entries()) await q("INSERT INTO product_images(product_id,image_data,alt_text,sort_order) VALUES (?,?,?,?)",[id,image,p.name,index]); await audit(req,"update","product",id,p.name); await bump("products"); res.json({products:await products(),auditLogs:await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80")}); }));
+app.post("/api/admin/products", requireCsrf, asyncRoute(async (req,res) => { const p=req.body; for (const key of ["name","category","price","productType","summary","details","packSize","audience"]) if (!String(p[key]||"").trim()) return res.status(400).json({error:`${key} is required`}); const unitPrice=Number(p.unitPrice ?? parsePriceAmount(p.price)),stockQuantity=Number(p.stockQuantity ?? 0); if(!(unitPrice>0))return res.status(400).json({error:"A valid online price is required"}); if(!Number.isSafeInteger(stockQuantity)||stockQuantity<0||stockQuantity>100000)return res.status(400).json({error:"Available packs must be between 0 and 100000"}); await q("INSERT IGNORE INTO product_categories(name,description) VALUES (?,?)",[p.category,`${p.category} products`]); const category=await one("SELECT id FROM product_categories WHERE name=?",[p.category]); const result=await q("INSERT INTO products(category_id,name,sku,price_label,unit_price,stock_quantity,ordering_enabled,product_type,summary,details,pack_size,audience,featured,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'active',?,?)",[category.id,p.name,`SE-${Date.now()}`,p.price,money(unitPrice),stockQuantity,p.orderingEnabled!==false,p.productType,p.summary,p.details,p.packSize,p.audience,Boolean(p.featured),now(),now()]); for (const [index,image] of (p.images||[]).entries()) await q("INSERT INTO product_images(product_id,image_data,alt_text,sort_order) VALUES (?,?,?,?)",[result.insertId,image,p.name,index]); await audit(req,"create","product",result.insertId,p.name); await bump("products"); res.status(201).json({products:await products(),auditLogs:await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80")}); }));
+app.put("/api/admin/products/:id", requireCsrf, asyncRoute(async (req,res) => { const id=Number(req.params.id),p=req.body,unitPrice=Number(p.unitPrice ?? parsePriceAmount(p.price)),stockQuantity=Number(p.stockQuantity ?? 0); if(!(unitPrice>0))return res.status(400).json({error:"A valid online price is required"}); if(!Number.isSafeInteger(stockQuantity)||stockQuantity<0||stockQuantity>100000)return res.status(400).json({error:"Available packs must be between 0 and 100000"}); await q("INSERT IGNORE INTO product_categories(name,description) VALUES (?,?)",[p.category,`${p.category} products`]); const category=await one("SELECT id FROM product_categories WHERE name=?",[p.category]); await q("UPDATE products SET category_id=?,name=?,price_label=?,unit_price=?,stock_quantity=?,ordering_enabled=?,product_type=?,summary=?,details=?,pack_size=?,audience=?,featured=?,updated_at=? WHERE id=?",[category.id,p.name,p.price,money(unitPrice),stockQuantity,p.orderingEnabled!==false,p.productType,p.summary,p.details,p.packSize,p.audience,Boolean(p.featured),now(),id]); await q("DELETE FROM product_images WHERE product_id=?",[id]); for (const [index,image] of (p.images||[]).entries()) await q("INSERT INTO product_images(product_id,image_data,alt_text,sort_order) VALUES (?,?,?,?)",[id,image,p.name,index]); await audit(req,"update","product",id,p.name); await bump("products"); res.json({products:await products(),auditLogs:await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80")}); }));
 app.delete("/api/admin/products/:id", requireCsrf, asyncRoute(async (req,res) => { const id=Number(req.params.id); await q("DELETE FROM product_images WHERE product_id=?",[id]); await q("DELETE FROM products WHERE id=?",[id]); await audit(req,"delete","product",id,"Product deleted"); await bump("products"); res.json({products:await products(),auditLogs:await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80")}); }));
 app.get("/api/admin/inquiries", asyncRoute(async (_req,res) => res.json({inquiries:await q("SELECT * FROM inquiries ORDER BY id DESC LIMIT 100"),auditLogs:await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80")})));
 app.post("/api/admin/inquiries/:id/status", requireCsrf, asyncRoute(async (req,res) => { const status=["new","contacted","closed"].includes(req.body.status)?req.body.status:null; if(!status)return res.status(400).json({error:"Invalid status"}); await q("UPDATE inquiries SET status=? WHERE id=?",[status,Number(req.params.id)]); await audit(req,"status","inquiry",req.params.id,status); await bump("inquiries"); res.json({inquiries:await q("SELECT * FROM inquiries ORDER BY id DESC LIMIT 100"),auditLogs:await q("SELECT * FROM admin_audit_logs ORDER BY id DESC LIMIT 80")}); }));
@@ -373,4 +547,4 @@ if (require.main === module) {
 }
 
 module.exports = app;
-module.exports._test = { escapeHtml, safeEmail, safeContact, normalizeEmail, normalizePhone, publicIdentity, signed, validSigned, poolOptions, generateDummyOtp };
+module.exports._test = { escapeHtml, safeEmail, safeContact, normalizeEmail, normalizePhone, publicIdentity, signed, validSigned, poolOptions, generateDummyOtp, parsePriceAmount, money, normalizeOrderItems, calculateOrderTotals };

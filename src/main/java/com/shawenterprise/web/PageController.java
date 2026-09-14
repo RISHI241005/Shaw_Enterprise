@@ -26,6 +26,8 @@ public class PageController {
 
     @GetMapping("/") String home(Model model) { model.addAttribute("products", catalog.featured(3)); model.addAttribute("metrics", catalog.metrics()); return "home"; }
     @GetMapping("/products") String products(Model model) { var products = catalog.all(); model.addAttribute("products", products); model.addAttribute("categories", products.stream().map(item -> item.category()).distinct().sorted().toList()); return "products"; }
+    @GetMapping("/checkout") String checkout() { return "checkout"; }
+    @GetMapping("/orders") String orders() { return "orders"; }
     @GetMapping("/feedback") String feedback(HttpServletRequest request, Model model) { sessions.visitorId(request); model.addAttribute("identityJson", "null"); return "feedback"; }
     @GetMapping("/contact") String contact() { return "contact"; }
 
@@ -38,8 +40,8 @@ public class PageController {
 
     @GetMapping({"/admin", "/admin/{tab}"}) String admin(HttpServletRequest request, @PathVariable(required = false) String tab, Model model) {
         if (!sessions.isAdmin(request)) return "redirect:/login";
-        var active = tab == null ? "products" : tab;
-        if (!java.util.Set.of("products", "inquiries", "feedback", "audits", "settings").contains(active)) active = "products";
+        var active = tab == null ? "orders" : tab;
+        if (!java.util.Set.of("orders", "products", "inquiries", "feedback", "audits", "settings").contains(active)) active = "orders";
         model.addAttribute("activeTab", active); model.addAttribute("metrics", catalog.metrics()); return "admin";
     }
 }
