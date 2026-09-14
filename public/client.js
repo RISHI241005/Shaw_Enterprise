@@ -530,6 +530,8 @@ async function submitInquiry(form) {
 
 function productPanelHtml(product, reviews) {
   const images = product.images?.length ? product.images : ["/images/product.svg"];
+  const details = product.details ? `<p>${escapeHtml(product.details)}</p>` : "";
+  const specs = [["Type",product.productType],["Pack size",product.packSize],["Best for",product.audience]].filter(([,value]) => value);
   return `
     <div class="product-panel-backdrop" data-close-panel></div>
     <div class="product-panel-card">
@@ -542,14 +544,10 @@ function productPanelHtml(product, reviews) {
         <p class="tag">${escapeHtml(product.category)}</p>
         <h2>${escapeHtml(product.name)}</h2>
         <strong class="panel-price">${escapeHtml(product.price)}</strong>
-        <p>${escapeHtml(product.details)}</p>
-        <dl>
-          <div><dt>Type</dt><dd>${escapeHtml(product.productType)}</dd></div>
-          <div><dt>Pack size</dt><dd>${escapeHtml(product.packSize)}</dd></div>
-          <div><dt>Best for</dt><dd>${escapeHtml(product.audience)}</dd></div>
-        </dl>
+        ${details}
+        ${specs.length ? `<dl>${specs.map(([label,value]) => `<div><dt>${label}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>` : ""}
         <div class="panel-commerce">
-          <div><small>${product.inStock ? `${product.stockQuantity} packs available` : "Currently unavailable"}</small><strong>${formatMoney(product.unitPrice)} per listed pack</strong></div>
+          <div><small>${product.inStock ? `${product.stockQuantity} packs available` : "Online ordering unavailable"}</small><strong>${product.unitPrice > 0 ? `${formatMoney(product.unitPrice)} per listed pack` : "Contact us for pricing"}</strong></div>
           <button class="button primary add-panel-to-cart" data-product-id="${product.id}" type="button" ${product.inStock ? "" : "disabled"}>${product.inStock ? "Add to cart" : "Out of stock"}</button>
         </div>
         <a class="text-link" href="/contact">Need a custom bulk quote?</a>
@@ -611,6 +609,8 @@ function readImageFile(file) {
 }
 
 function productFormData(form) {
+  const unitPrice = form.elements.unitPrice.value.trim();
+  const stockQuantity = form.elements.stockQuantity.value.trim();
   return {
     id: form.elements.id.value,
     name: form.elements.name.value,
@@ -623,8 +623,8 @@ function productFormData(form) {
     details: form.elements.details.value,
     images: state.productFormImages,
     featured: form.elements.featured.checked,
-    unitPrice: Number(form.elements.unitPrice.value),
-    stockQuantity: Number(form.elements.stockQuantity.value),
+    unitPrice: unitPrice ? Number(unitPrice) : null,
+    stockQuantity: stockQuantity ? Number(stockQuantity) : 0,
     orderingEnabled: form.elements.orderingEnabled.checked
   };
 }
@@ -636,8 +636,8 @@ function fillProductForm(product) {
   form.elements.name.value = product.name;
   form.elements.category.value = product.category;
   form.elements.price.value = product.price;
-  form.elements.unitPrice.value = product.unitPrice;
-  form.elements.stockQuantity.value = product.stockQuantity;
+  form.elements.unitPrice.value = product.unitPrice > 0 ? product.unitPrice : "";
+  form.elements.stockQuantity.value = product.stockQuantity > 0 ? product.stockQuantity : "";
   form.elements.productType.value = product.productType;
   form.elements.packSize.value = product.packSize;
   form.elements.audience.value = product.audience;

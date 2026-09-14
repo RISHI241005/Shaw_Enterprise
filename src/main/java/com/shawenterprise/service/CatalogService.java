@@ -72,10 +72,10 @@ public class CatalogService {
             statement.setLong(1, categoryId);
             statement.setString(2, clean(request.name()));
             statement.setString(3, "PENDING-" + System.nanoTime());
-            statement.setString(4, clean(request.price()));
+            statement.setString(4, displayPrice(request));
             statement.setBigDecimal(5, request.unitPrice());
             statement.setInt(6, request.stockQuantity());
-            statement.setBoolean(7, request.orderingEnabled());
+            statement.setBoolean(7, orderingEnabled(request));
             statement.setString(8, clean(request.productType()));
             statement.setString(9, clean(request.summary()));
             statement.setString(10, clean(request.details()));
@@ -98,7 +98,7 @@ public class CatalogService {
         get(id);
         var changed = jdbc.update("""
             UPDATE products SET category_id=?,name=?,price_label=?,unit_price=?,stock_quantity=?,ordering_enabled=?,product_type=?,summary=?,details=?,pack_size=?,audience=?,featured=?,updated_at=? WHERE id=?
-            """, category(request.category()), clean(request.name()), clean(request.price()), request.unitPrice(), request.stockQuantity(), request.orderingEnabled(), clean(request.productType()), clean(request.summary()),
+            """, category(request.category()), clean(request.name()), displayPrice(request), request.unitPrice(), request.stockQuantity(), orderingEnabled(request), clean(request.productType()), clean(request.summary()),
             clean(request.details()), clean(request.packSize()), clean(request.audience()), request.featured(), Timestamp.valueOf(LocalDateTime.now()), id);
         if (changed == 0) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Product not found");
         replaceImages(id, request.images(), request.name());
@@ -126,7 +126,7 @@ public class CatalogService {
         }
         return rows.stream().map(row -> new ProductDto(
             ((Number) row.get("id")).longValue(), string(row, "sku"), string(row, "name"), string(row, "category"), string(row, "price_label"),
-            (java.math.BigDecimal) row.get("unit_price"), ((Number) row.get("stock_quantity")).intValue(), truthy(row.get("ordering_enabled")), truthy(row.get("ordering_enabled")) && ((Number) row.get("stock_quantity")).intValue() > 0,
+            (java.math.BigDecimal) row.get("unit_price"), ((Number) row.get("stock_quantity")).intValue(), truthy(row.get("ordering_enabled")), truthy(row.get("ordering_enabled")) && row.get("unit_price") != null && ((java.math.BigDecimal) row.get("unit_price")).signum() > 0 && ((Number) row.get("stock_quantity")).intValue() > 0,
             string(row, "product_type"), string(row, "summary"), string(row, "details"), string(row, "pack_size"), string(row, "audience"),
             images.getOrDefault(((Number) row.get("id")).longValue(), List.of()), truthy(row.get("featured"))
         )).toList();
@@ -134,9 +134,18 @@ public class CatalogService {
 
     private long category(String name) {
         var clean = clean(name);
+        if (clean.isBlank()) clean = "Uncategorized";
         jdbc.update("INSERT INTO product_categories(name,description) VALUES (?,?) ON DUPLICATE KEY UPDATE description=description", clean, clean + " products for Shaw Enterprise catalog");
         return jdbc.queryForObject("SELECT id FROM product_categories WHERE name=?", Long.class, clean);
     }
+
+    private String displayPrice(ProductRequest request) {
+        var label = clean(request.price());
+        if (!label.isBlank()) return label;
+        return request.unitPrice() == null ? "Price on request" : "Rs. " + request.unitPrice().stripTrailingZeros().toPlainString() + " / pack";
+    }
+
+    private boolean orderingEnabled(ProductRequest request) { return request.orderingEnabled() && request.unitPrice() != null && request.unitPrice().signum() > 0; }
 
     private void replaceImages(long productId, List<String> values, String name) {
         jdbc.update("DELETE FROM product_images WHERE product_id=?", productId);

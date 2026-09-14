@@ -63,3 +63,22 @@ test("calculates delivery from server-side item prices", () => {
   assert.deepEqual(helpers.calculateOrderTotals([{ unitPrice: 250, quantity: 4 }], "delivery"), { subtotal: 1000, deliveryFee: 0, total: 1000 });
   assert.deepEqual(helpers.calculateOrderTotals([{ unitPrice: 150, quantity: 2 }], "pickup"), { subtotal: 300, deliveryFee: 0, total: 300 });
 });
+
+test("allows admins to create a product with only a name", () => {
+  assert.deepEqual(helpers.normalizeProductPayload({ name: "Custom party cup" }), {
+    name: "Custom party cup",
+    category: "Uncategorized",
+    price: "Price on request",
+    unitPrice: null,
+    stockQuantity: 0,
+    orderingEnabled: false,
+    productType: "",
+    summary: "",
+    details: "",
+    packSize: "",
+    audience: "",
+    images: [],
+    featured: false
+  });
+  assert.throws(() => helpers.normalizeProductPayload({}), /Product name is required/);
+});
