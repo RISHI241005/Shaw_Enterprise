@@ -59,16 +59,17 @@ test("normalizes duplicate cart lines without trusting client totals", () => {
 });
 
 test("calculates delivery from server-side item prices", () => {
-  assert.deepEqual(helpers.calculateOrderTotals([{ unitPrice: 150, quantity: 2 }], "delivery"), { subtotal: 300, deliveryFee: 99, total: 399 });
-  assert.deepEqual(helpers.calculateOrderTotals([{ unitPrice: 250, quantity: 4 }], "delivery"), { subtotal: 1000, deliveryFee: 0, total: 1000 });
-  assert.deepEqual(helpers.calculateOrderTotals([{ unitPrice: 150, quantity: 2 }], "pickup"), { subtotal: 300, deliveryFee: 0, total: 300 });
+  assert.deepEqual(helpers.calculateOrderTotals([{ unitPrice: 150, quantity: 2 }], "delivery"), { subtotal: 300, deliveryFee: 99, total: 399, pricingPending: false });
+  assert.deepEqual(helpers.calculateOrderTotals([{ unitPrice: 250, quantity: 4 }], "delivery"), { subtotal: 1000, deliveryFee: 0, total: 1000, pricingPending: false });
+  assert.deepEqual(helpers.calculateOrderTotals([{ unitPrice: 150, quantity: 2 }], "pickup"), { subtotal: 300, deliveryFee: 0, total: 300, pricingPending: false });
+  assert.deepEqual(helpers.calculateOrderTotals([{ unitPrice: null, quantity: 2 }], "delivery"), { subtotal: 0, deliveryFee: 0, total: 0, pricingPending: true });
 });
 
 test("allows admins to create a product with only a name", () => {
   assert.deepEqual(helpers.normalizeProductPayload({ name: "Custom party cup" }), {
     name: "Custom party cup",
     category: "Uncategorized",
-    price: "Price on request",
+    price: "",
     unitPrice: null,
     stockQuantity: 0,
     orderingEnabled: false,
@@ -80,5 +81,6 @@ test("allows admins to create a product with only a name", () => {
     images: [],
     featured: false
   });
+  assert.equal(helpers.normalizeProductPayload({ name: "Unpriced online cup", orderingEnabled: true }).orderingEnabled, true);
   assert.throws(() => helpers.normalizeProductPayload({}), /Product name is required/);
 });

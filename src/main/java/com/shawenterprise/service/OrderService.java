@@ -72,6 +72,7 @@ public class OrderService {
         if (rows.size() != ids.size()) conflict("One or more products are no longer available.");
         var orderItems = new ArrayList<Map<String, Object>>();
         var subtotal = BigDecimal.ZERO;
+        var pricingPending = false;
         for (var row : rows) {
             var id = ((Number) row.get("id")).longValue();
             var quantity = quantities.get(id);
@@ -81,13 +82,15 @@ public class OrderService {
             var name = String.valueOf(row.get("name"));
             if (!"active".equals(row.get("status")) || !enabled) conflict(name + " is not available for online ordering.");
             if (quantity > stock) conflict("Only " + stock + " pack(s) of " + name + " are currently available.");
-            if (price == null || price.signum() <= 0) conflict(name + " does not have a valid online price.");
-            var lineTotal = price.multiply(BigDecimal.valueOf(quantity)).setScale(2, RoundingMode.HALF_UP);
+            var hasPrice = price != null && price.signum() > 0;
+            if (!hasPrice) pricingPending = true;
+            var storedPrice = hasPrice ? price : BigDecimal.ZERO.setScale(2);
+            var lineTotal = storedPrice.multiply(BigDecimal.valueOf(quantity)).setScale(2, RoundingMode.HALF_UP);
             subtotal = subtotal.add(lineTotal);
-            orderItems.add(Map.of("productId", id, "sku", row.get("sku"), "name", name, "priceLabel", row.get("price_label"), "unitPrice", price, "quantity", quantity, "lineTotal", lineTotal));
+            orderItems.add(Map.of("productId", id, "sku", row.get("sku"), "name", name, "priceLabel", hasPrice ? row.get("price_label") : "", "unitPrice", storedPrice, "quantity", quantity, "lineTotal", lineTotal));
         }
         subtotal = subtotal.setScale(2, RoundingMode.HALF_UP);
-        var deliveryFee = "delivery".equals(fulfillment) && subtotal.compareTo(FREE_DELIVERY_MINIMUM) < 0 ? DELIVERY_FEE : BigDecimal.ZERO.setScale(2);
+        var deliveryFee = "delivery".equals(fulfillment) && !pricingPending && subtotal.compareTo(FREE_DELIVERY_MINIMUM) < 0 ? DELIVERY_FEE : BigDecimal.ZERO.setScale(2);
         var total = subtotal.add(deliveryFee);
         var created = LocalDateTime.now();
         var reference = "SE-" + LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE) + "-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8).toUpperCase(Locale.ROOT);

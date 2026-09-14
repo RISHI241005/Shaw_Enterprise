@@ -74,10 +74,10 @@ function normalizeProductPayload(input = {}) {
   return {
     name,
     category: cleanText(input.category, 120) || "Uncategorized",
-    price: cleanText(input.price, 80) || (unitPrice ? `Rs. ${unitPrice} / pack` : "Price on request"),
+    price: cleanText(input.price, 80) || (unitPrice ? `Rs. ${unitPrice} / pack` : ""),
     unitPrice,
     stockQuantity,
-    orderingEnabled: input.orderingEnabled === true && unitPrice !== null,
+    orderingEnabled: input.orderingEnabled === true,
     productType: cleanText(input.productType, 160),
     summary: cleanText(input.summary, 2000),
     details: cleanText(input.details, 10000),
@@ -238,7 +238,13 @@ async function products() {
   const images = await q("SELECT product_id,image_data FROM product_images ORDER BY product_id,sort_order");
   const grouped = new Map();
   for (const image of images) { if (!grouped.has(String(image.product_id))) grouped.set(String(image.product_id), []); grouped.get(String(image.product_id)).push(image.image_data); }
-  return rows.map((row) => ({ id: Number(row.id), sku: row.sku, name: row.name, category: row.category, price: row.price_label, unitPrice: Number(row.unit_price ?? parsePriceAmount(row.price_label) ?? 0), stockQuantity: Number(row.stock_quantity || 0), orderingEnabled: Boolean(row.ordering_enabled), inStock: Boolean(row.ordering_enabled) && Number(row.stock_quantity || 0) > 0, productType: row.product_type, summary: row.summary, details: row.details, packSize: row.pack_size, audience: row.audience, images: grouped.get(String(row.id)) || [], featured: Boolean(row.featured), createdAt: row.created_at, updatedAt: row.updated_at }));
+  return rows.map((row) => {
+    const parsedPrice = Number(row.unit_price ?? parsePriceAmount(row.price_label) ?? 0);
+    const unitPrice = parsedPrice > 0 ? parsedPrice : null;
+    const storedLabel = cleanText(row.price_label, 80);
+    const price = unitPrice && storedLabel.toLowerCase() !== "price on request" ? (storedLabel || `Rs. ${unitPrice} / pack`) : "";
+    return { id: Number(row.id), sku: row.sku, name: row.name, category: row.category, price, unitPrice, stockQuantity: Number(row.stock_quantity || 0), orderingEnabled: Boolean(row.ordering_enabled), inStock: Boolean(row.ordering_enabled) && Number(row.stock_quantity || 0) > 0, productType: row.product_type, summary: row.summary, details: row.details, packSize: row.pack_size, audience: row.audience, images: grouped.get(String(row.id)) || [], featured: Boolean(row.featured), createdAt: row.created_at, updatedAt: row.updated_at };
+  });
 }
 async function product(id) { return (await products()).find((item) => item.id === Number(id)) || null; }
 async function business() {
@@ -273,6 +279,11 @@ async function feedbackThreads(visitorId, options = {}) {
 }
 
 function orderView(row, items = []) {
+  const mappedItems = items.map((item) => {
+    const unitPrice = Number(item.unit_price);
+    const hasPrice = unitPrice > 0;
+    return { id: Number(item.id), productId: item.product_id ? Number(item.product_id) : null, sku: item.sku, productName: item.product_name, price: hasPrice ? item.price_label : "", unitPrice: hasPrice ? unitPrice : null, quantity: Number(item.quantity), lineTotal: hasPrice ? Number(item.line_total) : null };
+  });
   return {
     id: Number(row.id), orderNumber: row.order_number, customerName: row.customer_name,
     email: row.email, phone: row.phone, fulfillmentMethod: row.fulfillment_method,
@@ -280,7 +291,7 @@ function orderView(row, items = []) {
     state: row.state, postalCode: row.postal_code, notes: row.notes || "", status: row.status,
     subtotal: Number(row.subtotal), deliveryFee: Number(row.delivery_fee), total: Number(row.total),
     createdAt: row.created_at, updatedAt: row.updated_at,
-    items: items.map((item) => ({ id: Number(item.id), productId: item.product_id ? Number(item.product_id) : null, sku: item.sku, productName: item.product_name, price: item.price_label, unitPrice: Number(item.unit_price), quantity: Number(item.quantity), lineTotal: Number(item.line_total) }))
+    pricingPending: mappedItems.some((item) => item.unitPrice === null), items: mappedItems
   };
 }
 
@@ -313,8 +324,9 @@ function normalizeOrderItems(value) {
 
 function calculateOrderTotals(items, fulfillmentMethod) {
   const subtotal = money(items.reduce((sum, item) => sum + Number(item.unitPrice) * Number(item.quantity), 0));
-  const deliveryFee = fulfillmentMethod === "delivery" && subtotal < FREE_DELIVERY_MINIMUM ? DELIVERY_FEE : 0;
-  return { subtotal, deliveryFee, total: money(subtotal + deliveryFee) };
+  const pricingPending = items.some((item) => !(Number(item.unitPrice) > 0));
+  const deliveryFee = fulfillmentMethod === "delivery" && !pricingPending && subtotal < FREE_DELIVERY_MINIMUM ? DELIVERY_FEE : 0;
+  return { subtotal, deliveryFee, total: money(subtotal + deliveryFee), pricingPending };
 }
 
 async function createOrder(req) {
@@ -341,11 +353,11 @@ async function createOrder(req) {
     if (rows.length !== requested.length) throw publicError(409, "One or more products are no longer available.");
     const orderItems = requested.map((requestedItem) => {
       const productRow = rows.find((row) => Number(row.id) === requestedItem.productId);
-      const unitPrice = Number(productRow.unit_price ?? parsePriceAmount(productRow.price_label) ?? 0);
+      const parsedPrice = Number(productRow.unit_price ?? parsePriceAmount(productRow.price_label) ?? 0);
+      const unitPrice = parsedPrice > 0 ? money(parsedPrice) : 0;
       if (productRow.status !== "active" || !productRow.ordering_enabled) throw publicError(409, `${productRow.name} is not available for online ordering.`);
       if (requestedItem.quantity > Number(productRow.stock_quantity)) throw publicError(409, `Only ${Number(productRow.stock_quantity)} pack(s) of ${productRow.name} are currently available.`);
-      if (!(unitPrice > 0)) throw publicError(409, `${productRow.name} does not have a valid online price.`);
-      return { ...requestedItem, sku: productRow.sku, name: productRow.name, priceLabel: productRow.price_label, unitPrice, lineTotal: money(unitPrice * requestedItem.quantity) };
+      return { ...requestedItem, sku: productRow.sku, name: productRow.name, priceLabel: unitPrice > 0 ? productRow.price_label : "", unitPrice, lineTotal: money(unitPrice * requestedItem.quantity) };
     });
     const { subtotal, deliveryFee, total } = calculateOrderTotals(orderItems, fulfillmentMethod);
     const reference = orderNumber();
@@ -367,7 +379,8 @@ async function createOrder(req) {
 
 function productCard(item) {
   const summary = item.summary ? `<p>${escapeHtml(item.summary)}</p>` : "";
-  return `<article class="product-card" data-product-id="${item.id}" data-product-name="${escapeHtml(item.name)}" data-price="${item.unitPrice}" data-price-label="${escapeHtml(item.price)}" data-image="${escapeHtml(item.images[0] || "/images/product.svg")}" data-stock="${item.stockQuantity}" data-name="${escapeHtml(`${item.name} ${item.category} ${item.summary}`.toLowerCase())}" data-category="${escapeHtml(item.category.toLowerCase())}" data-summary="${escapeHtml(item.summary.toLowerCase())}" data-details="${escapeHtml(item.details.toLowerCase())}" data-pack="${escapeHtml(item.packSize.toLowerCase())}" data-audience="${escapeHtml(item.audience.toLowerCase())}"><img src="${escapeHtml(item.images[0] || "/images/product.svg")}" alt="${escapeHtml(item.name)}"><div class="product-card-body"><p class="tag">${escapeHtml(item.category)}</p><h3>${escapeHtml(item.name)}</h3>${summary}<div class="product-meta"><strong>${escapeHtml(item.price)}</strong><span>${item.inStock ? `${item.stockQuantity} packs in stock` : "Online ordering unavailable"}</span></div><div class="product-card-actions"><button class="button small ghost view-product" type="button" data-product-id="${item.id}">View</button><button class="button small primary add-to-cart" type="button" data-product-id="${item.id}" ${item.inStock ? "" : "disabled"}>${item.inStock ? "Add to cart" : "Unavailable"}</button></div></div></article>`;
+  const price = item.price ? `<strong>${escapeHtml(item.price)}</strong>` : "";
+  return `<article class="product-card" data-product-id="${item.id}" data-product-name="${escapeHtml(item.name)}" data-price="${item.unitPrice || ""}" data-price-label="${escapeHtml(item.price)}" data-image="${escapeHtml(item.images[0] || "/images/product.svg")}" data-stock="${item.stockQuantity}" data-name="${escapeHtml(`${item.name} ${item.category} ${item.summary}`.toLowerCase())}" data-category="${escapeHtml(item.category.toLowerCase())}" data-summary="${escapeHtml(item.summary.toLowerCase())}" data-details="${escapeHtml(item.details.toLowerCase())}" data-pack="${escapeHtml(item.packSize.toLowerCase())}" data-audience="${escapeHtml(item.audience.toLowerCase())}"><img src="${escapeHtml(item.images[0] || "/images/product.svg")}" alt="${escapeHtml(item.name)}"><div class="product-card-body"><p class="tag">${escapeHtml(item.category)}</p><h3>${escapeHtml(item.name)}</h3>${summary}<div class="product-meta">${price}<span>${item.inStock ? `${item.stockQuantity} packs in stock` : "Online ordering unavailable"}</span></div><div class="product-card-actions"><button class="button small ghost view-product" type="button" data-product-id="${item.id}">View</button><button class="button small primary add-to-cart" type="button" data-product-id="${item.id}" ${item.inStock ? "" : "disabled"}>${item.inStock ? "Add to cart" : "Unavailable"}</button></div></div></article>`;
 }
 function layout(title, content, req, info) {
   const nav = [["/", "Home"], ["/products", "Products"], ["/orders", "My Orders"], ["/feedback", "Feedback"], ["/contact", "Contact"], [isAdmin(req) ? "/admin" : "/login", "Admin"]];
@@ -420,7 +433,7 @@ app.get("/products", asyncRoute(async (req, res) => {
 }));
 app.get("/checkout", asyncRoute(async (req, res) => {
   const info = await business();
-  res.send(layout("Checkout", `<section class="page-title compact"><p class="eyebrow">Secure checkout</p><h1>Complete your order.</h1><p>Prices and stock are rechecked when you place the order.</p></section><section class="checkout-shell"><form id="checkoutForm" class="checkout-form"><div class="checkout-card"><div class="section-head"><div><p class="eyebrow">Contact</p><h2>Customer details</h2></div></div><div class="form-grid"><label>Full name<input name="customerName" autocomplete="name" required maxlength="160"></label><label>Email<input name="email" type="email" autocomplete="email" required maxlength="180"></label><label>Phone<input name="phone" type="tel" autocomplete="tel" required maxlength="40" placeholder="+91 98765 43210"></label></div></div><div class="checkout-card"><div class="section-head"><div><p class="eyebrow">Fulfilment</p><h2>How should we prepare it?</h2></div></div><div class="fulfilment-options"><label><input type="radio" name="fulfillmentMethod" value="delivery" checked><span><strong>Delivery</strong><small>₹${DELIVERY_FEE}; free above ₹${FREE_DELIVERY_MINIMUM}</small></span></label><label><input type="radio" name="fulfillmentMethod" value="pickup"><span><strong>Store pickup</strong><small>No delivery fee</small></span></label></div><div class="form-grid address-fields"><label class="wide">Address<input name="addressLine" autocomplete="street-address" required maxlength="255"></label><label>City<input name="city" autocomplete="address-level2" required maxlength="120"></label><label>State<input name="state" autocomplete="address-level1" required maxlength="120"></label><label>Postal code<input name="postalCode" autocomplete="postal-code" required maxlength="20"></label></div><label>Order note (optional)<textarea name="notes" rows="3" maxlength="1000" placeholder="Delivery landmark, preferred pickup time, or packing request"></textarea></label></div><div class="checkout-card payment-note"><p class="eyebrow">Payment</p><h2 id="paymentMethodTitle">Cash on delivery</h2><p id="paymentMethodCopy">Pay when your order reaches you. No card details are collected on this website.</p></div><button class="button primary checkout-submit" type="submit">Place order</button><p class="form-note checkout-status" aria-live="polite"></p></form><aside class="checkout-summary"><p class="eyebrow">Order summary</p><h2>Your cart</h2><div id="checkoutItems"></div><div id="checkoutTotals"></div></aside></section>`, req, info));
+  res.send(layout("Checkout", `<section class="page-title compact"><p class="eyebrow">Secure checkout</p><h1>Complete your order.</h1><p>Stock is rechecked when you place the order. If a price is hidden, the admin will confirm the final amount.</p></section><section class="checkout-shell"><form id="checkoutForm" class="checkout-form"><div class="checkout-card"><div class="section-head"><div><p class="eyebrow">Contact</p><h2>Customer details</h2></div></div><div class="form-grid"><label>Full name<input name="customerName" autocomplete="name" required maxlength="160"></label><label>Email<input name="email" type="email" autocomplete="email" required maxlength="180"></label><label>Phone<input name="phone" type="tel" autocomplete="tel" required maxlength="40" placeholder="+91 98765 43210"></label></div></div><div class="checkout-card"><div class="section-head"><div><p class="eyebrow">Fulfilment</p><h2>How should we prepare it?</h2></div></div><div class="fulfilment-options"><label><input type="radio" name="fulfillmentMethod" value="delivery" checked><span><strong>Delivery</strong><small>₹${DELIVERY_FEE}; free above ₹${FREE_DELIVERY_MINIMUM}</small></span></label><label><input type="radio" name="fulfillmentMethod" value="pickup"><span><strong>Store pickup</strong><small>No delivery fee</small></span></label></div><div class="form-grid address-fields"><label class="wide">Address<input name="addressLine" autocomplete="street-address" required maxlength="255"></label><label>City<input name="city" autocomplete="address-level2" required maxlength="120"></label><label>State<input name="state" autocomplete="address-level1" required maxlength="120"></label><label>Postal code<input name="postalCode" autocomplete="postal-code" required maxlength="20"></label></div><label>Order note (optional)<textarea name="notes" rows="3" maxlength="1000" placeholder="Delivery landmark, preferred pickup time, or packing request"></textarea></label></div><div class="checkout-card payment-note"><p class="eyebrow">Payment</p><h2 id="paymentMethodTitle">Cash on delivery</h2><p id="paymentMethodCopy">Pay when your order reaches you. No card details are collected on this website.</p></div><button class="button primary checkout-submit" type="submit">Place order</button><p class="form-note checkout-status" aria-live="polite"></p></form><aside class="checkout-summary"><p class="eyebrow">Order summary</p><h2>Your cart</h2><div id="checkoutItems"></div><div id="checkoutTotals"></div></aside></section>`, req, info));
 }));
 app.get("/orders", asyncRoute(async (req, res) => {
   const info = await business();
@@ -437,7 +450,7 @@ app.get(["/admin", "/admin/:tab"], asyncRoute(async (req, res) => {
   if (!isAdmin(req)) return res.redirect("/login"); const active = req.params.tab || "orders"; const [stats, info] = await Promise.all([metrics(), business()]);
   const sections = {
     orders: `<section class="admin-section"><div class="section-head"><div><p class="eyebrow">Fulfilment queue</p><h2>Online Orders</h2></div><span class="admin-order-count">${stats.orders.active} active</span></div><div id="adminOrders" class="admin-list"><p class="empty">Loading orders…</p></div></section>`,
-    products: `<section class="admin-section"><div class="section-head"><div><h2>Product Management</h2><p>Only the product name is required. Add as much or as little information as you want.</p></div></div><form id="productForm" class="admin-form"><input type="hidden" name="id"><label>Name <small>Required</small><input name="name" required></label><label>Category <small>Optional</small><input name="category" placeholder="Defaults to Uncategorized"></label><label>Display price <small>Optional</small><input name="price" placeholder="Defaults to Price on request"></label><label>Price per listed pack (₹) <small>Optional</small><input name="unitPrice" type="number" min="0.01" step="0.01"></label><label>Available packs <small>Optional</small><input name="stockQuantity" type="number" min="0" max="100000" step="1" placeholder="Defaults to 0"></label><label>Type <small>Optional</small><input name="productType"></label><label>Pack Size <small>Optional</small><input name="packSize"></label><label>Audience <small>Optional</small><input name="audience"></label><label>Summary <small>Optional</small><textarea name="summary" rows="2"></textarea></label><label>Details <small>Optional</small><textarea name="details" rows="4"></textarea></label><label>Product Images <small>Optional</small><input name="imageFiles" type="file" accept="image/*" multiple></label><input name="images" type="hidden"><div class="image-preview-grid" id="imagePreviewGrid"></div><label class="check"><input name="featured" type="checkbox"> Featured product</label><label class="check"><input name="orderingEnabled" type="checkbox"> Available for online ordering <small>(requires a price)</small></label><div class="admin-actions"><button class="button primary" type="submit">Save Product</button><button class="button ghost" id="resetProductForm" type="button">Clear</button></div></form><div id="adminProducts" class="admin-list"></div></section>`,
+    products: `<section class="admin-section"><div class="section-head"><div><h2>Product Management</h2><p>Only the product name is required. Add as much or as little information as you want.</p></div></div><form id="productForm" class="admin-form"><input type="hidden" name="id"><label>Name <small>Required</small><input name="name" required></label><label>Category <small>Optional</small><input name="category" placeholder="Defaults to Uncategorized"></label><label>Display price <small>Optional</small><input name="price" placeholder="Leave blank to hide the price"></label><label>Price per listed pack (₹) <small>Optional</small><input name="unitPrice" type="number" min="0.01" step="0.01"></label><label>Available packs <small>Optional</small><input name="stockQuantity" type="number" min="0" max="100000" step="1" placeholder="Defaults to 0"></label><label>Type <small>Optional</small><input name="productType"></label><label>Pack Size <small>Optional</small><input name="packSize"></label><label>Audience <small>Optional</small><input name="audience"></label><label>Summary <small>Optional</small><textarea name="summary" rows="2"></textarea></label><label>Details <small>Optional</small><textarea name="details" rows="4"></textarea></label><label>Product Images <small>Optional</small><input name="imageFiles" type="file" accept="image/*" multiple></label><input name="images" type="hidden"><div class="image-preview-grid" id="imagePreviewGrid"></div><label class="check"><input name="featured" type="checkbox"> Featured product</label><label class="check"><input name="orderingEnabled" type="checkbox"> Available for online ordering <small>(price is optional)</small></label><div class="admin-actions"><button class="button primary" type="submit">Save Product</button><button class="button ghost" id="resetProductForm" type="button">Clear</button></div></form><div id="adminProducts" class="admin-list"></div></section>`,
     inquiries: `<section class="admin-section"><h2>Inquiries</h2><div id="adminInquiries" class="admin-list"></div></section>`,
     feedback: `<section class="admin-section"><h2>Feedback Moderation</h2><div id="adminFeedback" class="admin-list"></div></section>`,
     audits: `<section class="admin-section"><h2>Audit Log</h2><div id="auditLog" class="audit-list"></div></section>`,

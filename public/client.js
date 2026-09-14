@@ -94,7 +94,7 @@ function formatMoney(value) {
 function loadCart() {
   try {
     const stored = JSON.parse(localStorage.getItem(CART_KEY) || "[]");
-    state.cart = Array.isArray(stored) ? stored.filter((item) => Number.isSafeInteger(Number(item.id)) && Number(item.quantity) > 0).map((item) => ({ ...item, id: Number(item.id), unitPrice: Number(item.unitPrice), stock: Math.max(0, Number(item.stock) || 0), quantity: Math.min(99, Math.max(1, Number(item.quantity) || 1)) })) : [];
+    state.cart = Array.isArray(stored) ? stored.filter((item) => Number.isSafeInteger(Number(item.id)) && Number(item.quantity) > 0).map((item) => ({ ...item, id: Number(item.id), unitPrice: Number(item.unitPrice) > 0 ? Number(item.unitPrice) : null, priceLabel: Number(item.unitPrice) > 0 ? item.priceLabel : "", stock: Math.max(0, Number(item.stock) || 0), quantity: Math.min(99, Math.max(1, Number(item.quantity) || 1)) })) : [];
   } catch { state.cart = []; }
 }
 
@@ -104,13 +104,17 @@ function saveCart() {
 }
 
 function cartSubtotal() { return state.cart.reduce((sum, item) => sum + Number(item.unitPrice) * Number(item.quantity), 0); }
+function cartHasPendingPrice() { return state.cart.some((item) => !(Number(item.unitPrice) > 0)); }
 
 function cartItemHtml(item) {
+  const hasPrice = Number(item.unitPrice) > 0;
+  const priceLabel = hasPrice ? `<small>${escapeHtml(item.priceLabel || formatMoney(item.unitPrice))}</small>` : "";
+  const lineTotal = hasPrice ? `<strong>${formatMoney(item.unitPrice * item.quantity)}</strong>` : "";
   return `<article class="cart-item">
     <img src="${escapeHtml(item.image || "/images/product.svg")}" alt="">
-    <div><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.priceLabel || formatMoney(item.unitPrice))}</small>
+    <div><strong>${escapeHtml(item.name)}</strong>${priceLabel}
       <div class="quantity-control"><button class="cart-decrease" data-product-id="${item.id}" type="button" aria-label="Decrease quantity">−</button><input class="cart-quantity" data-product-id="${item.id}" type="number" min="1" max="${Math.min(99, Math.max(1,item.stock || 99))}" value="${item.quantity}" aria-label="Quantity for ${escapeHtml(item.name)}"><button class="cart-increase" data-product-id="${item.id}" type="button" aria-label="Increase quantity">+</button></div>
-    </div><div class="cart-line-end"><strong>${formatMoney(item.unitPrice * item.quantity)}</strong><button class="text-button cart-remove" data-product-id="${item.id}" type="button">Remove</button></div>
+    </div><div class="cart-line-end">${lineTotal}<button class="text-button cart-remove" data-product-id="${item.id}" type="button">Remove</button></div>
   </article>`;
 }
 
@@ -120,16 +124,16 @@ function renderCart() {
   const items = qs("#cartItems");
   const footer = qs("#cartFooter");
   if (items) items.innerHTML = state.cart.length ? state.cart.map(cartItemHtml).join("") : `<div class="cart-empty"><strong>Your cart is empty</strong><p>Browse the catalog and add the packs you need.</p><a class="button primary close-cart" href="/products">Shop products</a></div>`;
-  if (footer) footer.innerHTML = state.cart.length ? `<div class="cart-total"><span>Subtotal</span><strong>${formatMoney(cartSubtotal())}</strong></div><p>Delivery is calculated at checkout. Free delivery above ${formatMoney(FREE_DELIVERY_MINIMUM)}.</p><a class="button primary" href="/checkout">Proceed to checkout</a>` : "";
+  if (footer) footer.innerHTML = state.cart.length ? (cartHasPendingPrice() ? `<div class="cart-total"><span>Final amount</span><strong>Confirmed by admin</strong></div><p>You can place the order now. The admin will confirm pricing and delivery charges.</p><a class="button primary" href="/checkout">Proceed to checkout</a>` : `<div class="cart-total"><span>Subtotal</span><strong>${formatMoney(cartSubtotal())}</strong></div><p>Delivery is calculated at checkout. Free delivery above ${formatMoney(FREE_DELIVERY_MINIMUM)}.</p><a class="button primary" href="/checkout">Proceed to checkout</a>`) : "";
   renderCheckoutSummary();
 }
 
 function productFromCard(card) {
-  return { id: Number(card.dataset.productId), name: card.dataset.productName, unitPrice: Number(card.dataset.price), priceLabel: card.dataset.priceLabel, image: card.dataset.image, stock: Number(card.dataset.stock) };
+  return { id: Number(card.dataset.productId), name: card.dataset.productName, unitPrice: Number(card.dataset.price) > 0 ? Number(card.dataset.price) : null, priceLabel: card.dataset.priceLabel, image: card.dataset.image, stock: Number(card.dataset.stock) };
 }
 
 function addToCart(item, quantity = 1) {
-  if (!item || !(item.unitPrice > 0) || !(item.stock > 0)) throw new Error("This product is not currently available to order.");
+  if (!item || !(item.stock > 0)) throw new Error("This product is not currently available to order.");
   const existing = state.cart.find((line) => line.id === Number(item.id));
   if (existing) existing.quantity = Math.min(99, item.stock, existing.quantity + quantity);
   else state.cart.push({ ...item, id: Number(item.id), quantity: Math.min(quantity, item.stock) });
@@ -153,9 +157,10 @@ function renderCheckoutSummary() {
   const items = qs("#checkoutItems"), totals = qs("#checkoutTotals"), submit = qs(".checkout-submit");
   if (!items || !totals) return;
   const subtotal = cartSubtotal();
-  const deliveryFee = selectedFulfilment() === "delivery" && subtotal < FREE_DELIVERY_MINIMUM ? DELIVERY_FEE : 0;
-  items.innerHTML = state.cart.length ? state.cart.map((item) => `<div class="checkout-line"><span>${escapeHtml(item.name)} <small>× ${item.quantity}</small></span><strong>${formatMoney(item.unitPrice * item.quantity)}</strong></div>`).join("") : `<div class="cart-empty"><strong>Your cart is empty.</strong><a href="/products">Return to products</a></div>`;
-  totals.innerHTML = state.cart.length ? `<div><span>Subtotal</span><strong>${formatMoney(subtotal)}</strong></div><div><span>Delivery</span><strong>${deliveryFee ? formatMoney(deliveryFee) : "Free"}</strong></div><div class="checkout-grand-total"><span>Total</span><strong>${formatMoney(subtotal + deliveryFee)}</strong></div>` : "";
+  const pricingPending = cartHasPendingPrice();
+  const deliveryFee = selectedFulfilment() === "delivery" && !pricingPending && subtotal < FREE_DELIVERY_MINIMUM ? DELIVERY_FEE : 0;
+  items.innerHTML = state.cart.length ? state.cart.map((item) => `<div class="checkout-line"><span>${escapeHtml(item.name)} <small>× ${item.quantity}</small></span>${Number(item.unitPrice) > 0 ? `<strong>${formatMoney(item.unitPrice * item.quantity)}</strong>` : ""}</div>`).join("") : `<div class="cart-empty"><strong>Your cart is empty.</strong><a href="/products">Return to products</a></div>`;
+  totals.innerHTML = state.cart.length ? (pricingPending ? `<div class="checkout-grand-total"><span>Final amount</span><strong>Admin will confirm</strong></div><p>The order can be placed now. Pricing and delivery charges will be confirmed before fulfilment.</p>` : `<div><span>Subtotal</span><strong>${formatMoney(subtotal)}</strong></div><div><span>Delivery</span><strong>${deliveryFee ? formatMoney(deliveryFee) : "Free"}</strong></div><div class="checkout-grand-total"><span>Total</span><strong>${formatMoney(subtotal + deliveryFee)}</strong></div>`) : "";
   if (submit) submit.disabled = !state.cart.length;
 }
 
@@ -175,7 +180,8 @@ function orderHtml(order) {
   const address = order.fulfillmentMethod === "pickup" ? "Pickup from Shaw Enterprise" : [order.addressLine,order.city,order.state,order.postalCode].filter(Boolean).join(", ");
   const steps = ["placed","confirmed","packing","ready",...(order.fulfillmentMethod === "delivery" ? ["out_for_delivery"] : []),"delivered"];
   const progress = order.status === "cancelled" ? -1 : steps.indexOf(order.status);
-  return `<article class="order-card status-${escapeHtml(order.status)}" data-order-number="${escapeHtml(order.orderNumber)}"><div class="order-card-head"><div><span class="order-number">${escapeHtml(order.orderNumber)}</span><h3>${escapeHtml(orderStatusLabels[order.status] || order.status)}</h3></div><strong>${formatMoney(order.total)}</strong></div><div class="order-meta"><span>${new Date(order.createdAt).toLocaleString("en-IN")}</span><span>${escapeHtml(order.fulfillmentMethod === "pickup" ? "Store pickup" : "Delivery")}</span><span>${escapeHtml(order.paymentMethod === "pay_on_pickup" ? "Pay on pickup" : "Cash on delivery")}</span></div>${order.status === "cancelled" ? '<p class="cancelled-note">This order was cancelled and its stock was returned.</p>' : `<div class="order-progress" style="--steps:${steps.length}" data-status="${escapeHtml(order.status)}">${steps.map((step,index) => `<span class="${index < progress ? "complete" : index === progress ? "current" : ""}">${escapeHtml(orderStatusLabels[step])}</span>`).join("")}</div>`}<div class="order-products">${(order.items || []).map((item) => `<div><span>${escapeHtml(item.productName)} <small>× ${item.quantity}</small></span><strong>${formatMoney(item.lineTotal)}</strong></div>`).join("")}</div><div class="order-delivery"><strong>${escapeHtml(order.customerName)}</strong><span>${escapeHtml(address)}</span></div></article>`;
+  const pricingPending = order.pricingPending || (order.items || []).some((item) => !(Number(item.unitPrice) > 0));
+  return `<article class="order-card status-${escapeHtml(order.status)}" data-order-number="${escapeHtml(order.orderNumber)}"><div class="order-card-head"><div><span class="order-number">${escapeHtml(order.orderNumber)}</span><h3>${escapeHtml(orderStatusLabels[order.status] || order.status)}</h3></div><strong>${pricingPending ? "Amount to be confirmed" : formatMoney(order.total)}</strong></div><div class="order-meta"><span>${new Date(order.createdAt).toLocaleString("en-IN")}</span><span>${escapeHtml(order.fulfillmentMethod === "pickup" ? "Store pickup" : "Delivery")}</span><span>${escapeHtml(order.paymentMethod === "pay_on_pickup" ? "Pay on pickup" : "Cash on delivery")}</span></div>${order.status === "cancelled" ? '<p class="cancelled-note">This order was cancelled and its stock was returned.</p>' : `<div class="order-progress" style="--steps:${steps.length}" data-status="${escapeHtml(order.status)}">${steps.map((step,index) => `<span class="${index < progress ? "complete" : index === progress ? "current" : ""}">${escapeHtml(orderStatusLabels[step])}</span>`).join("")}</div>`}<div class="order-products">${(order.items || []).map((item) => `<div><span>${escapeHtml(item.productName)} <small>× ${item.quantity}</small></span>${Number(item.unitPrice) > 0 ? `<strong>${formatMoney(item.lineTotal)}</strong>` : ""}</div>`).join("")}</div><div class="order-delivery"><strong>${escapeHtml(order.customerName)}</strong><span>${escapeHtml(address)}</span></div></article>`;
 }
 
 async function refreshCustomerOrders() {
@@ -543,11 +549,11 @@ function productPanelHtml(product, reviews) {
       <div class="panel-info">
         <p class="tag">${escapeHtml(product.category)}</p>
         <h2>${escapeHtml(product.name)}</h2>
-        <strong class="panel-price">${escapeHtml(product.price)}</strong>
+        ${product.price ? `<strong class="panel-price">${escapeHtml(product.price)}</strong>` : ""}
         ${details}
         ${specs.length ? `<dl>${specs.map(([label,value]) => `<div><dt>${label}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>` : ""}
         <div class="panel-commerce">
-          <div><small>${product.inStock ? `${product.stockQuantity} packs available` : "Online ordering unavailable"}</small><strong>${product.unitPrice > 0 ? `${formatMoney(product.unitPrice)} per listed pack` : "Contact us for pricing"}</strong></div>
+          <div><small>${product.inStock ? `${product.stockQuantity} packs available` : "Online ordering unavailable"}</small>${product.unitPrice > 0 ? `<strong>${formatMoney(product.unitPrice)} per listed pack</strong>` : ""}</div>
           <button class="button primary add-panel-to-cart" data-product-id="${product.id}" type="button" ${product.inStock ? "" : "disabled"}>${product.inStock ? "Add to cart" : "Out of stock"}</button>
         </div>
         <a class="text-link" href="/contact">Need a custom bulk quote?</a>
