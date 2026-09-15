@@ -1159,6 +1159,9 @@ body.is-ready .hero-actions { opacity:1; transform:none; }
   letter-spacing: .16em;
 }
 
+main { transition: opacity 160ms ease, transform 160ms ease; }
+html.is-navigating main { opacity: .45; transform: translateY(3px); pointer-events: none; }
+
 /* Online ordering */
 .cart-nav {
   display: inline-flex; align-items: center; gap: 8px; min-height: 40px; padding: 8px 13px;

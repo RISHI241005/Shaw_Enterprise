@@ -9,6 +9,13 @@ class SessionContextTest {
     private final SessionContext sessions = new SessionContext();
 
     @Test
+    void preservesExistingNodeVisitorOrderHistory() {
+        var request = new MockHttpServletRequest();
+        request.setCookies(new jakarta.servlet.http.Cookie("visitor_id", "abcdef012345abcdef012345"));
+        assertThat(sessions.visitorId(request)).isEqualTo("abcdef012345abcdef012345");
+    }
+
+    @Test
     void createsStableVisitorAndCsrfTokens() {
         var request = new MockHttpServletRequest();
         assertThat(sessions.visitorId(request)).hasSize(32).isEqualTo(sessions.visitorId(request));

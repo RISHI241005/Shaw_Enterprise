@@ -3,6 +3,7 @@ package com.shawenterprise.service;
 import com.shawenterprise.model.ProductDto;
 import com.shawenterprise.model.ProductRequest;
 import org.springframework.http.HttpStatus;
+import org.springframework.context.event.EventListener;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowCallbackHandler;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
@@ -23,6 +24,7 @@ import java.util.Map;
 public class CatalogService {
     private final JdbcTemplate jdbc;
     private final LiveUpdateService live;
+    private volatile List<ProductDto> cachedProducts;
 
     public CatalogService(JdbcTemplate jdbc, LiveUpdateService live) {
         this.jdbc = jdbc;
@@ -30,16 +32,26 @@ public class CatalogService {
     }
 
     public List<ProductDto> all() {
-        return query("WHERE p.status='active' ORDER BY p.featured DESC, p.id ASC", new Object[0]);
+        var current = cachedProducts;
+        if (current != null) return current;
+        synchronized (this) {
+            if (cachedProducts == null) cachedProducts = List.copyOf(query("WHERE p.status='active' ORDER BY p.featured DESC, p.id ASC", new Object[0]));
+            return cachedProducts;
+        }
     }
 
     public List<ProductDto> featured(int limit) {
-        return query("WHERE p.status='active' AND p.featured=TRUE ORDER BY p.id ASC LIMIT ?", new Object[]{limit});
+        return all().stream().filter(ProductDto::featured).limit(Math.max(0, limit)).toList();
     }
 
     public ProductDto get(long id) {
-        return query("WHERE p.id=? AND p.status='active'", new Object[]{id}).stream().findFirst()
+        return all().stream().filter(item -> item.id() == id).findFirst()
             .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Product not found"));
+    }
+
+    @EventListener
+    void invalidate(LiveTopicEvent event) {
+        if ("products".equals(event.topic())) cachedProducts = null;
     }
 
     public Map<String, Object> metrics() {
@@ -90,7 +102,8 @@ public class CatalogService {
         jdbc.update("UPDATE products SET sku=? WHERE id=?", "SE-" + String.format("%04d", id), id);
         replaceImages(id, request.images(), request.name());
         live.publish("products");
-        return get(id);
+        return query("WHERE p.id=? AND p.status='active'", new Object[]{id}).stream().findFirst()
+            .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Product not found"));
     }
 
     @Transactional
@@ -103,7 +116,8 @@ public class CatalogService {
         if (changed == 0) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Product not found");
         replaceImages(id, request.images(), request.name());
         live.publish("products");
-        return get(id);
+        return query("WHERE p.id=? AND p.status='active'", new Object[]{id}).stream().findFirst()
+            .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Product not found"));
     }
 
     @Transactional

@@ -15,7 +15,16 @@ public class SessionContext {
     private final SecureRandom random = new SecureRandom();
 
     public String visitorId(HttpServletRequest request) {
-        return value(request.getSession(true), VISITOR, 16);
+        var session = request.getSession(true);
+        if (session.getAttribute(VISITOR) == null && request.getCookies() != null) {
+            for (var cookie : request.getCookies()) {
+                if ("visitor_id".equals(cookie.getName()) && cookie.getValue().matches("[a-f0-9]{24}")) {
+                    session.setAttribute(VISITOR, cookie.getValue());
+                    break;
+                }
+            }
+        }
+        return value(session, VISITOR, 16);
     }
 
     public String csrfToken(HttpServletRequest request) {

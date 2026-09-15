@@ -1,6 +1,8 @@
 # Shaw Enterprise
 
-Production-oriented website for a wholesale and retail disposable-products business. The Vercel deployment is one integrated project: a Node.js serverless function serves the pages and APIs and connects directly to MySQL or MySQL-compatible TiDB Cloud. The Java 21/Spring Boot implementation remains available for traditional container hosting.
+Production-oriented website for a wholesale and retail disposable-products business. Java 21 and Spring Boot are the primary application runtime. One container serves the responsive storefront, JSON APIs, admin portal, WebSocket updates, and MySQL/TiDB persistence.
+
+Migration status: Java packaging and unit tests pass, but the isolated Vercel container currently fails runtime startup with `FUNCTION_INVOCATION_FAILED`. Do not promote this migration until `/healthz`, page navigation, checkout, and WebSocket connections pass hosted verification. The production domain remains on the previous Node release.
 
 ## What works
 
@@ -14,19 +16,21 @@ Production-oriented website for a wholesale and retail disposable-products busin
 - Email-verified feedback, replies, likes/hearts, product reviews, and admin moderation
 - BCrypt for all newly created/reset administrator passwords
 - Session rotation, CSRF checks, rate limits, validation, safe output escaping, security headers, and audit logs
-- Server-sent events that synchronize product, feedback, enquiry, and business-setting changes across open browser tabs
+- Persistent WebSocket updates for products, orders, feedback, enquiries, and settings, with SSE fallback
+- Database-backed event versions and JDBC sessions that remain consistent across scaled application instances
+- History API navigation that swaps page content in place instead of reloading the browser on each internal click
+- In-memory catalog and business-setting caches invalidated by live database events
 - Embedded Google Map, Google Maps mobile directions URL, click-to-call, email, and WhatsApp links
 - Flyway schema migrations, Actuator health, Docker packaging, and Render configuration
 
 ## Run locally
 
-Requirements: Node.js 22+ and MySQL 8 or TiDB Cloud.
+Requirements: Java 21, Maven 3.9+, and MySQL 8 or TiDB Cloud.
 
-The ignored `.env` file is already configured for this computer. It keeps database/admin secrets out of committed source.
+Copy `.env.example` to an ignored `.env` file and add the database/admin secrets for the environment. Spring imports that file during local development.
 
 ```powershell
-npm install
-npm run dev
+mvn spring-boot:run
 ```
 
 Open [http://localhost:3000](http://localhost:3000). The admin portal is at [http://localhost:3000/login](http://localhost:3000/login).
@@ -34,8 +38,8 @@ Open [http://localhost:3000](http://localhost:3000). The admin portal is at [htt
 To build and test:
 
 ```powershell
-npm test
-npm run build
+mvn test
+mvn clean package
 ```
 
 Health checks:
@@ -50,7 +54,7 @@ Sign in and open **Admin → Business & Map**. Set the real business name, phone
 
 The navigation link uses Google's cross-platform Maps URL (`api=1`), which opens the Google Maps app on supported phones and does not require an API key. The embedded map also avoids a paid JavaScript Maps SDK key.
 
-The current database still contains placeholder contact details. Production mode intentionally refuses to launch until those are replaced.
+Production mode refuses to launch if placeholder contact details or insecure secrets remain.
 
 ## Configuration
 
@@ -58,10 +62,10 @@ Copy `.env.example` to `.env` on a new machine and fill in private values. Never
 
 Important values:
 
-- `DATABASE_URL`, or `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DATABASE`, `MYSQL_USER`, `MYSQL_PASSWORD`
+- `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DATABASE`, `MYSQL_USER`, `MYSQL_PASSWORD`
 - Vercel TiDB integration variables `TIDB_HOST`, `TIDB_PORT`, `TIDB_DATABASE`, `TIDB_USER`, `TIDB_PASSWORD`
 - `ADMIN_USER`, `ADMIN_PASSWORD`
-- `SESSION_SECRET`, `OTP_SECRET`
+- `OTP_SECRET` (the legacy Node runtime also uses `SESSION_SECRET`)
 - Demo OTP mode is enabled for this project: each email or phone request creates a fresh six-digit code and displays it on the page for 10 minutes.
 - Java admin registration and reset requests also return their fresh dummy codes to the on-screen status area.
 - `APP_PRODUCTION=true` in production
@@ -84,7 +88,8 @@ Public:
 - `POST /api/feedback/verify-otp` (email or phone)
 - `POST /api/feedback`
 - `POST /api/feedback/{id}/react`
-- `GET /api/live` (SSE)
+- `GET /ws/live` (primary WebSocket channel)
+- `GET /api/live` (SSE compatibility fallback)
 
 Authenticated admin:
 
@@ -105,9 +110,9 @@ Delivery costs Rs. 99 and is free for subtotals of Rs. 1,000 or more; pickup is 
 
 ## Vercel deployment
 
-`vercel.json` routes the complete website through `api/index.js`, so pages and APIs ship as one Vercel project. Connect a MySQL-compatible TiDB Cloud database from Vercel Storage; its `TIDB_*` variables are recognized automatically. The function creates missing tables and seeds the 300-product catalog when the database is empty.
+`Dockerfile.vercel` packages the Spring Boot application as the single Vercel service, so pages, APIs, sessions, and WebSockets ship together. Connect a MySQL-compatible TiDB Cloud database from Vercel Storage; both `TIDB_*` and conventional `MYSQL_*` variables are recognized. Flyway creates and upgrades the schema.
 
-The Node runtime is required on Vercel because Vercel does not provide an official Java/Spring runtime. To run the Java version instead, build the included Dockerfile and deploy it to a container host using `render.yaml`.
+`Dockerfile` and `render.yaml` provide the same Java deployment for Render or another container host. The older Node adapter under `api/` is retained only as a rollback/compatibility implementation and is not the primary runtime.
 
 Before enabling `APP_PRODUCTION=true`:
 
@@ -115,4 +120,4 @@ Before enabling `APP_PRODUCTION=true`:
 2. Use unique production database/admin/OTP secrets.
 3. Confirm that the visible dummy OTP behavior is appropriate for the deployment. Replace it with a private email/SMS provider before using verification as a real security boundary.
 4. Put the service behind HTTPS and take a MySQL backup.
-5. Run `npm test`, verify `/healthz`, then perform one enquiry and admin status change.
+5. Run `mvn test`, verify `/healthz` reports `runtime: spring-boot` and `liveSync: websocket`, then perform one enquiry and admin status change.

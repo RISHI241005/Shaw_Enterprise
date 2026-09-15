@@ -54,7 +54,13 @@ if (!reduceMotion) {
   window.addEventListener("scroll", updateScrollSignal, { passive: true });
   updateScrollSignal();
 
+}
+
+function setupInteractiveCards() {
+  if (reduceMotion) return;
   qsa(".product-card, .feature-grid article").forEach((card) => {
+    if (card.dataset.motionReady) return;
+    card.dataset.motionReady = "true";
     card.addEventListener("pointermove", (event) => {
       const box = card.getBoundingClientRect();
       const rx = ((event.clientY - box.top) / box.height - .5) * -5;
@@ -85,6 +91,69 @@ function fetchJson(url, options = {}) {
     if (!response.ok) throw new Error(data.error || "Request failed");
     return data;
   });
+}
+
+let navigationController = null;
+
+function isClientNavigation(link, event) {
+  if (!link || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return false;
+  if (link.target && link.target !== "_self" || link.hasAttribute("download") || link.dataset.noNavigation !== undefined) return false;
+  const url = new URL(link.href, window.location.href);
+  if (url.origin !== window.location.origin || url.pathname === "/logout") return false;
+  if (url.pathname === window.location.pathname && url.search === window.location.search && url.hash) return false;
+  return ["http:", "https:"].includes(url.protocol);
+}
+
+async function navigateTo(input, options = {}) {
+  const requestedUrl = new URL(input, window.location.href);
+  navigationController?.abort();
+  navigationController = new AbortController();
+  const scrollPosition = window.scrollY;
+  document.documentElement.classList.add("is-navigating");
+  try {
+    const response = await fetch(requestedUrl, {
+      headers: { "Accept": "text/html", "X-Shaw-Navigation": "true" },
+      signal: navigationController.signal
+    });
+    if (!response.ok) throw new Error(`Page could not be loaded (${response.status})`);
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.includes("text/html")) throw new Error("Page response was not HTML");
+    const html = await response.text();
+    const nextDocument = new DOMParser().parseFromString(html, "text/html");
+    const nextMain = nextDocument.querySelector("main");
+    if (!nextMain) throw new Error("Page content is unavailable");
+
+    closeCart();
+    closeProductPanel();
+    closeCommandPalette();
+    qs("main")?.replaceWith(nextMain);
+    const nextNav = nextDocument.querySelector(".site-nav");
+    const currentNav = qs(".site-nav");
+    if (nextNav && currentNav) currentNav.replaceWith(nextNav);
+    const nextFooter = nextDocument.querySelector(".site-footer");
+    const currentFooter = qs(".site-footer");
+    if (nextFooter && currentFooter) currentFooter.replaceWith(nextFooter);
+    const nextCsrf = nextDocument.querySelector("meta[name='csrf-token']")?.content;
+    if (nextCsrf) qs("meta[name='csrf-token']")?.setAttribute("content", nextCsrf);
+    document.title = nextDocument.title || document.title;
+
+    const finalUrl = new URL(response.url || requestedUrl, window.location.href);
+    if (options.history !== false) history[options.replace ? "replaceState" : "pushState"]({}, "", `${finalUrl.pathname}${finalUrl.search}${finalUrl.hash}`);
+    initializePage();
+    if (options.preserveScroll) window.scrollTo({ top: scrollPosition });
+    else if (finalUrl.hash) document.getElementById(finalUrl.hash.slice(1))?.scrollIntoView();
+    else window.scrollTo({ top: 0, behavior: reduceMotion ? "auto" : "smooth" });
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    if (options.fallback !== false) window.location.assign(requestedUrl.href);
+    else throw error;
+  } finally {
+    document.documentElement.classList.remove("is-navigating");
+  }
+}
+
+function refreshCurrentPage() {
+  return navigateTo(window.location.href, { history: false, preserveScroll: true, fallback: false });
 }
 
 function formatMoney(value) {
@@ -662,7 +731,7 @@ function renderAdminProducts(products) {
   root.innerHTML = state.adminProducts.map((product) => `
     <article class="admin-row">
       <img src="${escapeHtml(product.images?.[0] || "/images/product.svg")}" alt="" />
-      <div><strong>${escapeHtml(product.name)}</strong><p>${escapeHtml(product.price)} | ${escapeHtml(product.category)}</p><small>${product.orderingEnabled ? `${product.stockQuantity} packs available online` : "Online ordering disabled"}</small></div>
+      <div><strong>${escapeHtml(product.name)}</strong><p>${product.price ? `${escapeHtml(product.price)} · ` : ""}${escapeHtml(product.category)}</p><small>${product.orderingEnabled ? `${product.stockQuantity} packs available online` : "Online ordering disabled"}</small></div>
       <button class="button small ghost edit-product" data-product-id="${product.id}" type="button">Edit</button>
       <button class="button small danger delete-product" data-product-id="${product.id}" type="button">Delete</button>
     </article>`).join("") || "<p>No products found.</p>";
@@ -678,7 +747,8 @@ function renderAdminOrders(items) {
   state.adminOrders = items || [];
   root.innerHTML = state.adminOrders.length ? state.adminOrders.map((order) => {
     const next = order.status === "ready" ? (order.fulfillmentMethod === "pickup" ? ["delivered","cancelled"] : ["out_for_delivery","cancelled"]) : (adminOrderTransitions[order.status] || []);
-    return `<article class="admin-order status-${escapeHtml(order.status)}"><div class="admin-order-head"><div><span class="order-number">${escapeHtml(order.orderNumber)}</span><h3>${escapeHtml(order.customerName)}</h3><small>${new Date(order.createdAt).toLocaleString("en-IN")} · ${escapeHtml(order.phone)} · ${escapeHtml(order.email)}</small></div><strong>${formatMoney(order.total)}</strong></div><div class="order-products">${order.items.map((item) => `<div><span>${escapeHtml(item.productName)} <small>× ${item.quantity}</small></span><strong>${formatMoney(item.lineTotal)}</strong></div>`).join("")}</div><div class="admin-order-foot"><div><strong>${escapeHtml(order.fulfillmentMethod === "pickup" ? "Store pickup" : "Delivery")}</strong><span>${escapeHtml(order.fulfillmentMethod === "pickup" ? "Customer will collect" : [order.addressLine,order.city,order.state,order.postalCode].filter(Boolean).join(", "))}</span>${order.notes ? `<small>Note: ${escapeHtml(order.notes)}</small>` : ""}</div><label>Status<select class="order-status" data-order-id="${order.id}" ${next.length ? "" : "disabled"}><option value="${escapeHtml(order.status)}">${escapeHtml(orderStatusLabels[order.status] || order.status)}</option>${next.map((status) => `<option value="${status}">${escapeHtml(orderStatusLabels[status] || status)}</option>`).join("")}</select></label></div></article>`;
+    const pricingPending = order.pricingPending || order.items.some((item) => !(Number(item.unitPrice) > 0));
+    return `<article class="admin-order status-${escapeHtml(order.status)}"><div class="admin-order-head"><div><span class="order-number">${escapeHtml(order.orderNumber)}</span><h3>${escapeHtml(order.customerName)}</h3><small>${new Date(order.createdAt).toLocaleString("en-IN")} · ${escapeHtml(order.phone)} · ${escapeHtml(order.email)}</small></div><strong>${pricingPending ? "Set price with customer" : formatMoney(order.total)}</strong></div><div class="order-products">${order.items.map((item) => `<div><span>${escapeHtml(item.productName)} <small>× ${item.quantity}</small></span>${Number(item.unitPrice) > 0 ? `<strong>${formatMoney(item.lineTotal)}</strong>` : ""}</div>`).join("")}</div><div class="admin-order-foot"><div><strong>${escapeHtml(order.fulfillmentMethod === "pickup" ? "Store pickup" : "Delivery")}</strong><span>${escapeHtml(order.fulfillmentMethod === "pickup" ? "Customer will collect" : [order.addressLine,order.city,order.state,order.postalCode].filter(Boolean).join(", "))}</span>${order.notes ? `<small>Note: ${escapeHtml(order.notes)}</small>` : ""}</div><label>Status<select class="order-status" data-order-id="${order.id}" ${next.length ? "" : "disabled"}><option value="${escapeHtml(order.status)}">${escapeHtml(orderStatusLabels[order.status] || order.status)}</option>${next.map((status) => `<option value="${status}">${escapeHtml(orderStatusLabels[status] || status)}</option>`).join("")}</select></label></div></article>`;
   }).join("") : `<p class="empty">No online orders yet.</p>`;
 }
 
@@ -888,6 +958,23 @@ document.addEventListener("change", (event) => {
   if (event.target.matches("select[name='verificationChannel']")) updateVerificationForm(event.target);
   if (event.target.matches("input[name='fulfillmentMethod']")) setFulfilment(event.target.value);
   if (event.target.matches(".cart-quantity")) updateCartQuantity(event.target.dataset.productId, event.target.value);
+  if (event.target.matches("#feedbackSort")) { state.feedbackLimit = 6; refreshFeedback().catch(() => {}); }
+  if (event.target.matches("#productSort")) applyProductFilters();
+});
+
+document.addEventListener("input", (event) => {
+  if (event.target.matches("#productSearch")) applyProductFilters();
+});
+
+document.addEventListener("click", (event) => {
+  const link = event.target.closest("a[href]");
+  if (!isClientNavigation(link, event)) return;
+  event.preventDefault();
+  navigateTo(link.href).catch(() => {});
+});
+
+window.addEventListener("popstate", () => {
+  navigateTo(window.location.href, { history: false, fallback: true }).catch(() => {});
 });
 
 document.addEventListener("submit", async (event) => {
@@ -996,14 +1083,6 @@ document.addEventListener("change", async (event) => {
   }
 });
 
-qs("#feedbackSort")?.addEventListener("change", () => {
-  state.feedbackLimit = 6;
-  refreshFeedback();
-});
-
-qs("#productSearch")?.addEventListener("input", applyProductFilters);
-qs("#productSort")?.addEventListener("change", applyProductFilters);
-
 // The admin portal uses small, live API calls instead of page-to-page mock states.
 const authViews = {
   login: ["Welcome back", "Sign in to continue to your dashboard.", "New to the workspace?", "Create an account"],
@@ -1054,7 +1133,7 @@ document.addEventListener("submit", async (event) => {
   try {
     if (form.matches("#loginForm")) {
       const result = await fetchJson("/api/auth/login", { method: "POST", body: JSON.stringify(Object.fromEntries(new FormData(form))) });
-      window.location.assign(result.redirect || "/admin");
+      await navigateTo(result.redirect || "/admin");
       return;
     }
     if (form.matches("#registerForm")) {
@@ -1091,26 +1170,6 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
-const shell = qs(".feedback-shell");
-if (shell) {
-  try {
-    setFeedbackIdentity(JSON.parse(shell.dataset.identity || "null"));
-  } catch {
-    setFeedbackIdentity(null);
-  }
-  refreshFeedback();
-}
-
-loadCart();
-renderCart();
-setFulfilment(selectedFulfilment());
-refreshCustomerOrders().catch(() => {
-  const root = qs("#customerOrders"); if (root) root.innerHTML = `<p class="empty">Orders could not be loaded right now.</p>`;
-});
-refreshAdmin();
-
-setProductFormImages([]);
-
 const revealObserver = "IntersectionObserver" in window ? new IntersectionObserver((entries) => {
   entries.forEach((entry) => {
     if (entry.isIntersecting) {
@@ -1120,32 +1179,86 @@ const revealObserver = "IntersectionObserver" in window ? new IntersectionObserv
   });
 }, { threshold: 0.12 }) : null;
 
-qsa(".feature-grid article, .feedback-item, .admin-section, .contact-card, .contact-form").forEach((item, index) => {
-  item.classList.add("reveal");
-  item.style.setProperty("--reveal-delay", `${Math.min(index * 35, 280)}ms`);
-  if (revealObserver) revealObserver.observe(item);
-  else item.classList.add("is-visible");
-});
+function initializePage() {
+  const shell = qs(".feedback-shell");
+  if (shell) {
+    try { setFeedbackIdentity(JSON.parse(shell.dataset.identity || "null")); }
+    catch { setFeedbackIdentity(null); }
+    refreshFeedback().catch(() => {});
+  }
 
-applyProductFilters();
-
-// One lightweight stream keeps every open storefront/admin tab consistent with MySQL writes.
-if ("EventSource" in window) {
-  const live = new EventSource("/api/live");
-  let liveTimer = 0;
-  live.addEventListener("sync", (event) => {
-    window.clearTimeout(liveTimer);
-    liveTimer = window.setTimeout(async () => {
-      const topic = event.data;
-       if (document.querySelector(".admin-shell")) {
-         await refreshAdmin().catch(() => {});
-        if (topic === "settings" && document.querySelector("#businessSettingsForm")) window.location.reload();
-        return;
-      }
-       if (topic === "orders" && document.querySelector("#customerOrders")) await refreshCustomerOrders().catch(() => {});
-       else if (topic === "feedback" && document.querySelector("#feedbackList")) await refreshFeedback().catch(() => {});
-      else if (topic === "feedback" && state.productPanelProduct) await openProduct(state.productPanelProduct.id).catch(() => {});
-      else if ((topic === "products" && (location.pathname === "/" || location.pathname === "/products")) || (topic === "settings" && location.pathname === "/contact")) window.location.reload();
-    }, 250);
+  state.activeCategory = "all";
+  renderCart();
+  setFulfilment(selectedFulfilment());
+  refreshCustomerOrders().catch(() => {
+    const root = qs("#customerOrders");
+    if (root) root.innerHTML = `<p class="empty">Orders could not be loaded right now.</p>`;
   });
+  refreshAdmin().catch(() => {});
+  if (qs("#productForm")) setProductFormImages([]);
+  setupInteractiveCards();
+  qsa(".feature-grid article, .feedback-item, .admin-section, .contact-card, .contact-form").forEach((item, index) => {
+    item.classList.add("reveal");
+    item.style.setProperty("--reveal-delay", `${Math.min(index * 35, 280)}ms`);
+    if (revealObserver) revealObserver.observe(item);
+    else item.classList.add("is-visible");
+  });
+  applyProductFilters();
 }
+
+let liveTimer = 0;
+const pendingLiveTopics = new Set();
+async function handleLiveTopic(topic) {
+  pendingLiveTopics.add(topic);
+  window.clearTimeout(liveTimer);
+  liveTimer = window.setTimeout(async () => {
+    const topics = new Set(pendingLiveTopics);
+    pendingLiveTopics.clear();
+    if (qs(".admin-shell")) {
+      await refreshAdmin().catch(() => {});
+      if (topics.has("settings")) await refreshCurrentPage().catch(() => {});
+      return;
+    }
+    if (topics.has("orders") && qs("#customerOrders")) await refreshCustomerOrders().catch(() => {});
+    if (topics.has("feedback") && qs("#feedbackList")) await refreshFeedback().catch(() => {});
+    if (topics.has("feedback") && state.productPanelProduct) await openProduct(state.productPanelProduct.id).catch(() => {});
+    if (topics.has("settings") || (topics.has("products") && (location.pathname === "/" || location.pathname === "/products"))) await refreshCurrentPage().catch(() => {});
+  }, 150);
+}
+
+function startEventStreamFallback() {
+  if (!("EventSource" in window)) return;
+  const events = new EventSource("/api/live");
+  events.addEventListener("sync", (event) => handleLiveTopic(event.data));
+}
+
+function startLiveConnection() {
+  if (!("WebSocket" in window)) { startEventStreamFallback(); return; }
+  let failures = 0;
+  let reconnectDelay = 750;
+  const connect = () => {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(`${protocol}//${window.location.host}/ws/live`);
+    let opened = false;
+    socket.addEventListener("open", () => { opened = true; failures = 0; reconnectDelay = 750; document.documentElement.dataset.live = "connected"; });
+    socket.addEventListener("message", (event) => {
+      try {
+        const message = JSON.parse(event.data);
+        if (message.type === "sync" && message.topic) handleLiveTopic(message.topic);
+      } catch { /* Ignore malformed transport frames. */ }
+    });
+    socket.addEventListener("close", () => {
+      document.documentElement.dataset.live = "reconnecting";
+      if (!opened) failures += 1;
+      if (failures >= 2) { startEventStreamFallback(); return; }
+      window.setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
+    });
+    socket.addEventListener("error", () => socket.close());
+  };
+  connect();
+}
+
+loadCart();
+initializePage();
+startLiveConnection();

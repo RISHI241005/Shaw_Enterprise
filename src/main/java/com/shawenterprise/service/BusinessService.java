@@ -2,6 +2,7 @@ package com.shawenterprise.service;
 
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowCallbackHandler;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -16,6 +17,7 @@ public class BusinessService {
     private static final List<String> KEYS = List.of("business_name", "phone", "email", "address", "whatsapp", "hours");
     private final JdbcTemplate jdbc;
     private final LiveUpdateService live;
+    private volatile Map<String, String> cachedSettings;
 
     public BusinessService(JdbcTemplate jdbc, LiveUpdateService live) {
         this.jdbc = jdbc;
@@ -23,6 +25,15 @@ public class BusinessService {
     }
 
     public Map<String, String> settings() {
+        var current = cachedSettings;
+        if (current != null) return new LinkedHashMap<>(current);
+        synchronized (this) {
+            if (cachedSettings == null) cachedSettings = loadSettings();
+            return new LinkedHashMap<>(cachedSettings);
+        }
+    }
+
+    private Map<String, String> loadSettings() {
         var result = new LinkedHashMap<String, String>();
         jdbc.query("SELECT setting_key, setting_value FROM business_settings", (RowCallbackHandler) row -> result.put(row.getString(1), row.getString(2)));
         result.putIfAbsent("business_name", "Shaw Enterprise");
@@ -38,6 +49,11 @@ public class BusinessService {
         return result;
     }
 
+    @EventListener
+    void invalidate(LiveTopicEvent event) {
+        if ("settings".equals(event.topic())) cachedSettings = null;
+    }
+
     @Transactional
     public Map<String, String> update(Map<String, String> values) {
         for (var key : KEYS) {
@@ -45,6 +61,7 @@ public class BusinessService {
             if (value.isBlank()) throw new IllegalArgumentException(key + " is required");
             jdbc.update("INSERT INTO business_settings(setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value)", key, value);
         }
+        cachedSettings = null;
         live.publish("settings");
         return settings();
     }

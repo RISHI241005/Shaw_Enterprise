@@ -1,0 +1,7 @@
+target/
+node_modules/
+.git/
+.vercel/
+.env
+*.log
+data/backups/

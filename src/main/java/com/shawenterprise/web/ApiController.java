@@ -48,10 +48,10 @@ public class ApiController {
 
     @GetMapping("/healthz") Map<String, Object> health() {
         var products = jdbc.queryForObject("SELECT COUNT(*) FROM products", Long.class);
-        return Map.of("ok", true, "service", "shaw-enterprise-java", "database", "mysql", "products", products == null ? 0 : products, "liveSync", true);
+        return Map.of("ok", true, "service", "shaw-enterprise-java", "runtime", "spring-boot", "database", "mysql", "products", products == null ? 0 : products, "liveSync", "websocket", "liveClients", live.socketCount());
     }
 
-    @GetMapping("/api/live") SseEmitter live() { return live.connect(); }
+    @GetMapping("/api/live") SseEmitter live() { return live.connectEvents(); }
     @GetMapping("/api/products") Map<String, Object> products() { return Map.of("products", catalog.all()); }
     @GetMapping("/api/products/{id}") Map<String, Object> product(HttpServletRequest request, @PathVariable long id) {
         return Map.of("product", catalog.get(id), "reviews", feedback.threads(sessions.visitorId(request), "top", id, false));
