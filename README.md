@@ -2,7 +2,7 @@
 
 Production-oriented website for a wholesale and retail disposable-products business. Java 21 and Spring Boot are the primary application runtime. One container serves the responsive storefront, JSON APIs, admin portal, WebSocket updates, and MySQL/TiDB persistence.
 
-Migration status: Java packaging and unit tests pass, but the isolated Vercel container currently fails runtime startup with `FUNCTION_INVOCATION_FAILED`. Do not promote this migration until `/healthz`, page navigation, checkout, and WebSocket connections pass hosted verification. The production domain remains on the previous Node release.
+The Java container is verified on Vercel with the existing 300-product TiDB catalog. The function runs in Singapore (`sin1`) near the database to keep startup and API latency low. A TiDB-compatible initializer pre-creates Flyway's standard history table without `CREATE TABLE ... SELECT`; Flyway still owns migration locking and checksum validation.
 
 ## What works
 
