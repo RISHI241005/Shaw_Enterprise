@@ -132,8 +132,14 @@ public class OrderService {
         return rows.stream().map(row -> {
             var id = ((Number) row.get("id")).longValue();
             var items = itemRows.stream().filter(item -> ((Number) item.get("order_id")).longValue() == id).map(item -> new OrderDto.OrderItemDto(((Number)item.get("id")).longValue(), item.get("product_id") == null ? null : ((Number)item.get("product_id")).longValue(), String.valueOf(item.get("sku")), String.valueOf(item.get("product_name")), String.valueOf(item.get("price_label")), (BigDecimal)item.get("unit_price"), ((Number)item.get("quantity")).intValue(), (BigDecimal)item.get("line_total"))).toList();
-            return new OrderDto(id,String.valueOf(row.get("order_number")),String.valueOf(row.get("customer_name")),String.valueOf(row.get("email")),String.valueOf(row.get("phone")),String.valueOf(row.get("fulfillment_method")),String.valueOf(row.get("payment_method")),String.valueOf(row.get("address_line")),String.valueOf(row.get("city")),String.valueOf(row.get("state")),String.valueOf(row.get("postal_code")),String.valueOf(row.get("notes")),String.valueOf(row.get("status")),(BigDecimal)row.get("subtotal"),(BigDecimal)row.get("delivery_fee"),(BigDecimal)row.get("total"),((Timestamp)row.get("created_at")).toLocalDateTime(),((Timestamp)row.get("updated_at")).toLocalDateTime(),items);
+            return new OrderDto(id,String.valueOf(row.get("order_number")),String.valueOf(row.get("customer_name")),String.valueOf(row.get("email")),String.valueOf(row.get("phone")),String.valueOf(row.get("fulfillment_method")),String.valueOf(row.get("payment_method")),String.valueOf(row.get("address_line")),String.valueOf(row.get("city")),String.valueOf(row.get("state")),String.valueOf(row.get("postal_code")),String.valueOf(row.get("notes")),String.valueOf(row.get("status")),(BigDecimal)row.get("subtotal"),(BigDecimal)row.get("delivery_fee"),(BigDecimal)row.get("total"),dateTime(row.get("created_at")),dateTime(row.get("updated_at")),items);
         }).toList();
+    }
+
+    static LocalDateTime dateTime(Object value) {
+        if (value instanceof LocalDateTime date) return date;
+        if (value instanceof Timestamp stamp) return stamp.toLocalDateTime();
+        throw new IllegalStateException("Unsupported database order date");
     }
 
     private Map<Long, Integer> orderQuantities(Object value) {

@@ -14,13 +14,19 @@ public record ProductRequest(
     @Size(max = 120) String category,
     @Size(max = 80) String price,
     @DecimalMin("0.01") BigDecimal unitPrice,
-    @Min(0) @Max(100000) int stockQuantity,
-    boolean orderingEnabled,
+    @Min(0) @Max(100000) Integer stockQuantity,
+    Boolean orderingEnabled,
     @Size(max = 160) String productType,
     @Size(max = 2000) String summary,
     @Size(max = 10000) String details,
     @Size(max = 160) String packSize,
     @Size(max = 180) String audience,
     List<@Size(max = 2_500_000) String> images,
-    boolean featured
-) {}
+    Boolean featured
+) {
+    public ProductRequest {
+        stockQuantity = stockQuantity == null ? 0 : stockQuantity;
+        orderingEnabled = Boolean.TRUE.equals(orderingEnabled);
+        featured = Boolean.TRUE.equals(featured);
+    }
+}

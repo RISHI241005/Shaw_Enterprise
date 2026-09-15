@@ -25,6 +25,10 @@ public record OrderDto(
     LocalDateTime updatedAt,
     List<OrderItemDto> items
 ) {
+    @com.fasterxml.jackson.annotation.JsonProperty("pricingPending")
+    public boolean pricingPending() {
+        return items.stream().anyMatch(item -> item.unitPrice() == null || item.unitPrice().signum() <= 0);
+    }
     public record OrderItemDto(long id, Long productId, String sku, String productName, String price,
                                BigDecimal unitPrice, int quantity, BigDecimal lineTotal) {}
 }

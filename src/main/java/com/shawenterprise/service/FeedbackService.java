@@ -142,7 +142,7 @@ public class FeedbackService {
 
     @Transactional
     public void toggleVisibility(long id) {
-        if (jdbc.update("UPDATE feedback_comments SET status=IF(status='visible','hidden','visible') WHERE id=?", id) == 0)
+        if (jdbc.update("UPDATE feedback_comments SET status=CASE WHEN status='visible' THEN 'hidden' ELSE 'visible' END WHERE id=?", id) == 0)
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Feedback not found");
         live.publish("feedback");
     }
