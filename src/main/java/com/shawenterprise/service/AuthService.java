@@ -27,13 +27,16 @@ public class AuthService {
     private final String envPassword;
     private final boolean registrationEnabled;
     private final String otpSecret;
+    private final boolean production;
 
     public AuthService(JdbcTemplate jdbc,
                        @Value("${app.admin.username}") String envUser,
                        @Value("${app.admin.password}") String envPassword,
                        @Value("${app.admin.registration-enabled:false}") boolean registrationEnabled,
-                       @Value("${app.otp.secret}") String otpSecret) {
+                       @Value("${app.otp.secret}") String otpSecret,
+                       @Value("${app.production:false}") boolean production) {
         this.jdbc = jdbc; this.envUser = envUser; this.envPassword = envPassword; this.registrationEnabled = registrationEnabled; this.otpSecret = otpSecret;
+        this.production = production;
     }
 
     public String authenticate(String identifier, String password) {
@@ -49,6 +52,7 @@ public class AuthService {
 
     @Transactional
     public Map<String, Object> register(String username, String email, String phone, String password) {
+        requireDemoAuthAllowed();
         if (!registrationEnabled) throw new ResponseStatusException(HttpStatus.FORBIDDEN, "New administrator registration is disabled. Ask the owner to enable it temporarily.");
         var user = username == null ? "" : username.trim(); var mail = email == null ? "" : email.trim().toLowerCase(); var mobile = normalizePhone(phone);
         if (user.length() < 3 || user.length() > 80) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Username must be 3–80 characters");
@@ -70,6 +74,7 @@ public class AuthService {
 
     @Transactional
     public Map<String, Object> resend(long accountId) {
+        requireDemoAuthAllowed();
         var account = jdbc.queryForMap("SELECT email,phone FROM admin_accounts WHERE id=?", accountId);
         var result = new LinkedHashMap<String, Object>(); result.put("message", "Fresh verification codes created.");
         issue(accountId, String.valueOf(account.get("email")), "email", "signup", "devEmailCode", result);
@@ -79,6 +84,7 @@ public class AuthService {
 
     @Transactional
     public void verify(long accountId, String emailCode, String phoneCode) {
+        requireDemoAuthAllowed();
         var account = jdbc.queryForMap("SELECT email,phone FROM admin_accounts WHERE id=?", accountId);
         if (!consume(accountId, String.valueOf(account.get("email")), "email", "signup", emailCode) || !consume(accountId, String.valueOf(account.get("phone")), "phone", "signup", phoneCode))
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "One or both verification codes are invalid or expired");
@@ -87,6 +93,7 @@ public class AuthService {
 
     @Transactional
     public Map<String, Object> requestReset(String email) {
+        requireDemoAuthAllowed();
         var mail = email == null ? "" : email.trim().toLowerCase();
         var result = new LinkedHashMap<String, Object>(); result.put("message", "If that account exists, a reset code has been created.");
         var accounts = jdbc.queryForList("SELECT id FROM admin_accounts WHERE email=?", mail);
@@ -96,12 +103,18 @@ public class AuthService {
 
     @Transactional
     public void resetPassword(String email, String code, String password) {
+        requireDemoAuthAllowed();
         if (password == null || password.length() < 12) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Password must be at least 12 characters");
         var mail = email == null ? "" : email.trim().toLowerCase(); var accounts = jdbc.queryForList("SELECT id FROM admin_accounts WHERE email=?", mail);
         if (accounts.isEmpty()) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid or expired reset code");
         var id = ((Number) accounts.getFirst().get("id")).longValue();
         if (!consume(id, mail, "email", "reset", code)) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid or expired reset code");
         jdbc.update("UPDATE admin_accounts SET password_hash=?,updated_at=? WHERE id=?", passwords.encode(password), Timestamp.valueOf(LocalDateTime.now()), id);
+    }
+
+    private void requireDemoAuthAllowed() {
+        if (production) throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+            "Administrator verification and password recovery require secure email delivery. Contact the website owner.");
     }
 
     private void issue(long accountId, String destination, String channel, String purpose, String responseKey, Map<String, Object> result) {
